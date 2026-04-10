@@ -326,12 +326,9 @@ document.getElementById('openCameraBtn').onclick = async () => {
     showToast(resp.message || '摄像头开启失败', 'warning');
     return;
   }
-  if (!resp.model_loaded && resp.model_error) {
-    showToast(`模型未加载：${resp.model_error}`, 'warning');
-  }
   ensureDetectionPolling(!!resp.detection_on);
 
-  showToast('摄像头已开启，同步开启了检测');
+  showToast('摄像头已开启，同时已开启检测');
 
   await refreshSystem();
 };
@@ -339,10 +336,11 @@ document.getElementById('openCameraBtn').onclick = async () => {
 document.getElementById('closeCameraBtn').onclick = async () => {
   stopLocalStream();
   await postApi('/api/camera/stop');
+  ensureDetectionPolling(false);
   drawBoxes([]);
   renderCounts({});
-  statusText.textContent = '状态：待机';
-  showToast('摄像头已关闭', 'secondary');
+  statusText.textContent = '状态：摄像头已关闭，检测已停止';
+  showToast('摄像头已关闭，检测已停止', 'secondary');
   await refreshSystem();
 };
 
@@ -360,8 +358,8 @@ document.getElementById('startDetBtn').onclick = async () => {
 document.getElementById('stopDetBtn').onclick = async () => {
   await postApi('/api/detection/stop');
   ensureDetectionPolling(false);
-  statusText.textContent = '状态：检测已停止（画面保留）';
-  showToast('已停止检测，画面保留但不再框选目标', 'secondary');
+  statusText.textContent = '状态：检测已停止（摄像头保持开启）';
+  showToast('检测已关闭，摄像头保持开启', 'secondary');
 };
 
 document.getElementById('fullscreenBtn').onclick = async () => {

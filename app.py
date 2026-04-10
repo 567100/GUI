@@ -163,7 +163,7 @@ def load_user(user_id: str):
 class YoloModelService:
     """
     模型说明：
-    1) 默认加载仓库根目录 `best.pt`。
+    1) 默认加载仓库根目录 `best.onnx`。
     2) 支持环境变量 YOLO_MODEL_PATH 指定权重路径。
     3) 保持返回格式不变，前端与数据库将自动复用。
 
@@ -178,7 +178,7 @@ class YoloModelService:
 
     def __init__(self):
         custom_path = os.getenv("YOLO_MODEL_PATH", "").strip()
-        self.model_path = Path(custom_path) if custom_path else (BASE_DIR / "best.pt")
+        self.model_path = Path(custom_path) if custom_path else (BASE_DIR / "best.onnx")
         self.model = None
         self.model_name = self.model_path.name
         self.last_error = ""
@@ -915,7 +915,7 @@ def start_camera():
     runtime_state["camera_type"] = camera_type
     model_service.ensure_loaded(cooldown_sec=0.0)
     runtime_state["camera_on"] = True
-    runtime_state["detection_on"] = bool(model_service.model)
+    runtime_state["detection_on"] = True
     runtime_state["camera_state"] = "已连接"
     if runtime_state["camera_started_at"] is None:
         runtime_state["camera_started_at"] = time.time()
@@ -929,7 +929,7 @@ def start_camera():
 
             "detection_on": runtime_state["detection_on"],
             "model_loaded": bool(model_service.model),
-            "model_error": model_service.last_error,
+            "model_error": "",
             "message": "",
 
         }

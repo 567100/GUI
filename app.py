@@ -1,0 +1,1607 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+
+import time
+import socket
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+from werkzeug.security import check_password_hash, generate_password_hash
+
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+    has_request_context,
+)
+from flask_login import (
+    LoginManager,
+    UserMixin,
+    current_user,
+    login_required,
+    login_user,
+    logout_user,
+)
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func, inspect, text
+from sqlalchemy.orm import Session
+
+try:
+    import serial
+except ImportError:  # pragma: no cover
+    serial = None
+try:
+    from serial.tools import list_ports
+except ImportError:  # pragma: no cover
+    list_ports = None
+
+try:
+    from ultralytics import YOLO
+except ImportError:  # pragma: no cover
+    YOLO = None
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "instance" / "yolo_monitor.db"
+
+
+def resolve_database_uri() -> str:
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if database_url:
+        # Render/Heroku 历史上可能提供 postgres:// 前缀，SQLAlchemy 2 需要 postgresql://
+        if database_url.startswith("postgres://"):
+            return database_url.replace("postgres://", "postgresql://", 1)
+        return database_url
+    return f"sqlite:///{DB_PATH}"
+
+
+DB_URI = resolve_database_uri()
+IS_SQLITE = DB_URI.startswith("sqlite:")
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv("SECRET_KEY", "replace-this-with-a-long-random-secret"),
+    SQLALCHEMY_DATABASE_URI=DB_URI,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SQLALCHEMY_ENGINE_OPTIONS={
+        "pool_pre_ping": True,
+        # Render 免费实例连接数有限，保持小池并及时回收，防止 QueuePool 耗尽。
+        "pool_recycle": int(os.getenv("SQLALCHEMY_POOL_RECYCLE", "180")),
+        "pool_size": int(os.getenv("SQLALCHEMY_POOL_SIZE", "2")),
+        "max_overflow": int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", "3")),
+        "pool_timeout": int(os.getenv("SQLALCHEMY_POOL_TIMEOUT", "15")),
+        "pool_use_lifo": True,
+    }
+    if not IS_SQLITE
+    else {},
+    REMEMBER_COOKIE_DURATION=timedelta(days=180),
+    REMEMBER_COOKIE_HTTPONLY=True,
+    REMEMBER_COOKIE_SAMESITE="Lax",
+)
+app.permanent_session_lifetime = timedelta(days=180)
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
+login_manager.login_message = "请先登录后再访问监控系统。"
+
+
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(50), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    is_active_account = db.Column(db.Boolean, default=True)
+    last_login_at = db.Column(db.DateTime, nullable=True)
+    email = db.Column(db.String(120), nullable=False, default="")
+    phone = db.Column(db.String(30), nullable=False, default="")
+    avatar_url = db.Column(db.String(255), nullable=False, default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class DetectionRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    detect_time = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    category = db.Column(db.String(50), nullable=False, index=True)
+    count = db.Column(db.Integer, nullable=False)
+    confidence = db.Column(db.Float, nullable=False)
+    operator_name = db.Column(db.String(50), nullable=False, default="system")
+    operation_type = db.Column(db.String(50), nullable=False, default="自动检测")
+    note = db.Column(db.String(255), nullable=False, default="")
+
+
+class SystemLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    operator = db.Column(db.String(50), nullable=False, default="system")
+    ip = db.Column(db.String(64), nullable=False, default="-")
+    result = db.Column(db.String(20), nullable=False, default="成功")
+    log_type = db.Column(db.String(50), nullable=False)
+    content = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+
+class SystemConfig(db.Model):
+    key = db.Column(db.String(80), primary_key=True)
+    value = db.Column(db.Text, nullable=False, default="")
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DailyDetectionDuration(db.Model):
+    day = db.Column(db.String(10), primary_key=True)  # YYYY-MM-DD
+    seconds = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+@login_manager.user_loader
+def load_user(user_id: str):
+    return db.session.get(User, int(user_id))
+
+
+class YoloModelService:
+    """
+    模型说明：
+    1) 默认加载仓库根目录 `best.pt`。
+    2) 支持环境变量 YOLO_MODEL_PATH 指定权重路径。
+    3) 保持返回格式不变，前端与数据库将自动复用。
+
+    返回格式:
+    {
+      "boxes": [
+        {"x": 120, "y": 90, "w": 160, "h": 180, "label": "person", "conf": 0.87}
+      ],
+      "counts": {"person": 2, "car": 1}
+    }
+    """
+
+    def __init__(self):
+        custom_path = os.getenv("YOLO_MODEL_PATH", "").strip()
+        self.model_path = Path(custom_path) if custom_path else (BASE_DIR / "best.pt")
+        self.model = None
+        self.model_name = self.model_path.name
+        self.last_error = ""
+        self.last_reload_attempt_ts = 0.0
+        self.reload()
+
+    def reload(self) -> tuple[bool, str]:
+        self.model = None
+        self.model_name = self.model_path.name
+        self.last_error = ""
+        self.last_reload_attempt_ts = time.time()
+        if not YOLO:
+            self.last_error = "未安装 ultralytics，无法加载 YOLO 权重"
+            return False, self.last_error
+        if not self.model_path.exists():
+            self.last_error = f"模型文件不存在：{self.model_path.name}"
+            return False, self.last_error
+        try:
+            self.model = YOLO(str(self.model_path))
+            return True, f"模型已加载：{self.model_path.name}"
+        except Exception as exc:
+            self.last_error = f"模型加载失败：{exc}"
+            return False, self.last_error
+
+    def ensure_loaded(self, cooldown_sec: float = 5.0) -> bool:
+        if self.model is not None:
+            return True
+        now = time.time()
+        if now - self.last_reload_attempt_ts < cooldown_sec:
+            return False
+        ok, _ = self.reload()
+        return ok
+
+    def predict_from_frame(self, frame_meta: dict | None = None) -> dict:
+        if self.model:
+            source = frame_meta.get("frame_array") if frame_meta else None
+            if source is None:
+                return {"boxes": [], "counts": {}, "warning": "未收到可用视频帧，无法进行推理"}
+            result = self.model.predict(source=source, verbose=False)[0]
+            boxes = []
+            counts = Counter()
+            for b in result.boxes:
+                cls_id = int(b.cls.item())
+                label = result.names.get(cls_id, str(cls_id))
+                conf = round(float(b.conf.item()), 2)
+                x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
+                boxes.append({"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "label": label, "conf": conf})
+                counts[label] += 1
+            return {"boxes": boxes, "counts": dict(counts)}
+        return {"boxes": [], "counts": {}, "warning": self.last_error or "模型未加载，无法推理"}
+
+
+model_service = YoloModelService()
+
+runtime_state = {
+    "camera_on": False,
+    "camera_state": "未连接",
+    "detection_on": False,
+    "last_detection_time": None,
+    "camera_type": "local",
+    "openmv_connected": False,
+    "openmv_mode": "serial",
+    "openmv_target": "",
+    "openmv_last_frame_at": None,
+    "openmv_last_len": 0,
+    "camera_started_at": None,
+    "last_inference_ms": 0,
+}
+
+openmv_serial_conn = None
+openmv_network_conn = None
+openmv_serial_buffer = bytearray()
+openmv_network_buffer = bytearray()
+
+openmv_settings = {
+    "camera_id": 0,
+    "resolution": "720P",
+    "fps": 15,
+    "baudrate": 115200,
+    "flip_horizontal": False,
+    "flip_vertical": False,
+    "exposure": 50,
+    "gain": 1.0,
+    "auto_white_balance": True,
+    "serial_timeout": 800,
+}
+
+
+def bjt_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def to_bjt(dt: datetime) -> datetime:
+    return dt + timedelta(hours=8)
+
+
+def hash_password(password: str) -> str:
+    return generate_password_hash(password)
+
+
+def verify_password(password_hash: str, password: str) -> bool:
+    return check_password_hash(password_hash, password)
+
+
+def clear_runtime_after_logout() -> None:
+    if runtime_state["camera_started_at"]:
+        add_duration_seconds(datetime.utcfromtimestamp(runtime_state["camera_started_at"]), datetime.utcnow())
+    runtime_state["camera_on"] = False
+    runtime_state["detection_on"] = False
+    runtime_state["camera_state"] = "未连接"
+    runtime_state["openmv_connected"] = False
+    runtime_state["camera_started_at"] = None
+
+
+def safe_fmt_dt(dt: datetime | None) -> str:
+    if not dt:
+        return "-"
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_camera_connected() -> bool:
+    if not runtime_state["camera_on"]:
+        return False
+    if runtime_state["camera_type"] == "openmv":
+        return bool(runtime_state["openmv_connected"])
+    return runtime_state["camera_state"] != "未连接"
+
+
+def sync_camera_state() -> bool:
+    connected = is_camera_connected()
+    runtime_state["camera_state"] = "已连接" if connected else "未连接"
+    if not connected:
+        runtime_state["detection_on"] = False
+    return connected
+
+
+
+def extract_jpeg_frame(buffer: bytearray) -> bytes:
+    start = buffer.find(b"\xff\xd8")
+    if start == -1:
+        if len(buffer) > 65536:
+            del buffer[:-2048]
+        return b""
+    end = buffer.find(b"\xff\xd9", start + 2)
+    if end == -1:
+        if start > 0:
+            del buffer[:start]
+        return b""
+    frame = bytes(buffer[start : end + 2])
+    del buffer[: end + 2]
+    return frame
+
+
+
+def add_log(log_type: str, content: str, user_id: int | None = None, result: str = "成功"):
+    """记录系统日志，且避免日志写入异常影响主流程。"""
+    operator = "system"
+    ip = request.remote_addr if has_request_context() else "-"
+    try:
+        with Session(db.engine, expire_on_commit=False) as local_session:
+            if user_id:
+                user = local_session.get(User, user_id)
+                if user:
+                    operator = user.username
+            local_session.add(
+                SystemLog(log_type=log_type, content=content, user_id=user_id, operator=operator, ip=ip or "-", result=result)
+            )
+            local_session.commit()
+    except Exception:
+        app.logger.exception("写入系统日志失败: %s", content)
+
+
+def set_config_json(key: str, value: dict):
+    payload = json.dumps(value, ensure_ascii=False)
+    with Session(db.engine, expire_on_commit=False) as local_session:
+        record = local_session.get(SystemConfig, key)
+        if record:
+            record.value = payload
+        else:
+            local_session.add(SystemConfig(key=key, value=payload))
+        local_session.commit()
+
+
+def get_config_json(key: str, default: dict):
+    with Session(db.engine, expire_on_commit=False) as local_session:
+        record = local_session.get(SystemConfig, key)
+    if not record:
+        return default
+    try:
+        data = json.loads(record.value)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    return default
+
+
+def add_duration_seconds(start_dt: datetime, end_dt: datetime):
+    if end_dt <= start_dt:
+        return
+    with Session(db.engine, expire_on_commit=False) as local_session:
+        cursor = start_dt
+        while cursor < end_dt:
+            cursor_bjt = to_bjt(cursor)
+            next_day_bjt = datetime(cursor_bjt.year, cursor_bjt.month, cursor_bjt.day) + timedelta(days=1)
+            next_day_utc = next_day_bjt - timedelta(hours=8)
+            seg_end = min(end_dt, next_day_utc)
+            seg_seconds = int((seg_end - cursor).total_seconds())
+            day_key = cursor_bjt.strftime("%Y-%m-%d")
+            rec = local_session.get(DailyDetectionDuration, day_key)
+            if not rec:
+                rec = DailyDetectionDuration(day=day_key, seconds=0)
+                local_session.add(rec)
+            rec.seconds += max(seg_seconds, 0)
+            cursor = seg_end
+        local_session.commit()
+
+
+def get_today_detection_seconds() -> int:
+    now = datetime.utcnow()
+    now_bjt = to_bjt(now)
+    day_key = now_bjt.strftime("%Y-%m-%d")
+    with Session(db.engine, expire_on_commit=False) as local_session:
+        rec = local_session.get(DailyDetectionDuration, day_key)
+    total = rec.seconds if rec else 0
+    if runtime_state["camera_on"] and runtime_state["camera_started_at"]:
+        start_ts = runtime_state["camera_started_at"]
+        start_dt = datetime.utcfromtimestamp(start_ts)
+        start_bjt = to_bjt(start_dt)
+        if start_bjt.strftime("%Y-%m-%d") == day_key:
+            total += int((now - start_dt).total_seconds())
+        elif start_dt < now:
+            day_start_bjt = datetime(now_bjt.year, now_bjt.month, now_bjt.day)
+            day_start = day_start_bjt - timedelta(hours=8)
+            total += int((now - day_start).total_seconds())
+    return max(total, 0)
+
+
+def init_db():
+    if IS_SQLITE:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with app.app_context():
+        db.create_all()
+        inspector = inspect(db.engine)
+
+        def ensure_column(table: str, name: str, ddl: str):
+            columns = {col["name"] for col in inspector.get_columns(table)}
+            if name in columns:
+                return
+            db.session.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+            db.session.commit()
+
+        user_columns = {col["name"] for col in inspector.get_columns("user")}
+        if "is_active_account" not in user_columns:
+            db.session.execute(
+                text(
+                    "ALTER TABLE user ADD COLUMN is_active_account BOOLEAN NOT NULL DEFAULT 1"
+                )
+            )
+            db.session.commit()
+        if "last_login_at" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN last_login_at DATETIME"))
+            db.session.commit()
+        if "email" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN email VARCHAR(120) NOT NULL DEFAULT ''"))
+            db.session.commit()
+        if "phone" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN phone VARCHAR(30) NOT NULL DEFAULT ''"))
+            db.session.commit()
+        if "avatar_url" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN avatar_url VARCHAR(255) NOT NULL DEFAULT ''"))
+            db.session.commit()
+        ensure_column("detection_record", "operator_name", "VARCHAR(50) NOT NULL DEFAULT 'system'")
+        ensure_column("detection_record", "operation_type", "VARCHAR(50) NOT NULL DEFAULT '目标检测'")
+        ensure_column("detection_record", "note", "VARCHAR(255) NOT NULL DEFAULT ''")
+        ensure_column("system_log", "operator", "VARCHAR(50) NOT NULL DEFAULT 'system'")
+        ensure_column("system_log", "ip", "VARCHAR(64) NOT NULL DEFAULT '-'")
+        ensure_column("system_log", "result", "VARCHAR(20) NOT NULL DEFAULT '成功'")
+
+        ensure_column("detection_record", "operator_name", "VARCHAR(50) NOT NULL DEFAULT 'system'")
+        ensure_column("detection_record", "operation_type", "VARCHAR(50) NOT NULL DEFAULT '目标检测'")
+        ensure_column("detection_record", "note", "VARCHAR(255) NOT NULL DEFAULT ''")
+        ensure_column("system_log", "operator", "VARCHAR(50) NOT NULL DEFAULT 'system'")
+
+        ensure_column("system_log", "ip", "VARCHAR(64) NOT NULL DEFAULT '-'")
+        ensure_column("system_log", "result", "VARCHAR(20) NOT NULL DEFAULT '成功'")
+
+        saved_openmv = get_config_json("openmv_settings", openmv_settings.copy())
+        openmv_settings.update(saved_openmv)
+        if not db.session.get(SystemConfig, "openmv_settings"):
+            set_config_json("openmv_settings", openmv_settings)
+
+        admin = User.query.filter_by(username="admin").first()
+        if not admin:
+            admin = User(
+                username="admin",
+                password_hash=hash_password("admin123456"),
+                is_admin=True,
+            )
+            db.session.add(admin)
+            db.session.commit()
+            add_log("system", "初始化默认管理员账号：admin/admin123456")
+
+
+def get_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+init_db()
+
+
+def parse_time_range(range_key: str, start_time: str, end_time: str):
+    now = datetime.utcnow()
+    if range_key == "today":
+        start = datetime(now.year, now.month, now.day)
+        end = now
+    elif range_key == "yesterday":
+        start = datetime(now.year, now.month, now.day) - timedelta(days=1)
+        end = datetime(now.year, now.month, now.day) - timedelta(seconds=1)
+    elif range_key == "7d":
+        start = now - timedelta(days=7)
+        end = now
+    elif range_key == "30d":
+        start = now - timedelta(days=30)
+        end = now
+    elif range_key == "custom":
+        try:
+            start = datetime.fromisoformat(start_time)
+            end = datetime.fromisoformat(end_time)
+        except (TypeError, ValueError):
+            return None, None
+    else:
+        start = now - timedelta(days=1)
+        end = now
+    return start, end
+
+
+@app.before_request
+def make_session_permanent():
+    if current_user.is_authenticated:
+        session.permanent = True
+        now_ts = int(time.time())
+        last_heartbeat = int(session.get("heartbeat_at", 0) or 0)
+        if now_ts - last_heartbeat >= 60:
+            current_user.last_login_at = datetime.utcnow()
+            db.session.commit()
+            session["heartbeat_at"] = now_ts
+
+
+def scoped_detection_query():
+    query = DetectionRecord.query
+    if not current_user.is_admin:
+        query = query.filter(DetectionRecord.user_id == current_user.id)
+    return query
+
+
+def _cleanup_db_session(exception=None):
+    """统一清理 DB 会话，避免连接池连接被长时间占用。"""
+    if exception is not None:
+        db.session.rollback()
+    db.session.remove()
+
+
+@app.teardown_request
+def shutdown_session_request(exception=None):
+    _cleanup_db_session(exception)
+
+
+@app.teardown_appcontext
+def shutdown_session_appcontext(exception=None):
+    _cleanup_db_session(exception)
+
+
+@app.route("/")
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for("monitor"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        remember = bool(request.form.get("remember", True))
+
+        try:
+            user = User.query.filter_by(username=username).first()
+            if user and verify_password(user.password_hash, password):
+                if not user.is_active_account:
+                    flash("账号已被禁用，请联系管理员", "danger")
+                    return render_template("login.html")
+
+                login_user(user, remember=remember)
+                user.last_login_at = datetime.utcnow()
+                db.session.commit()
+                add_log("auth", f"用户登录: {username}", user.id)
+                return redirect(url_for("monitor"))
+
+            flash("账号或密码错误", "danger")
+        except Exception:
+            db.session.rollback()
+            app.logger.exception("登录流程数据库操作失败")
+            flash("登录失败：数据库连接异常，请稍后重试", "danger")
+    return render_template("login.html")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not username or len(password) < 6:
+            flash("用户名不能为空，且密码长度至少 6 位", "warning")
+            return render_template("register.html")
+        if password != confirm_password:
+            flash("两次密码输入不一致", "warning")
+            return render_template("register.html")
+        if User.query.filter_by(username=username).first():
+            flash("用户名已存在", "warning")
+            return render_template("register.html")
+
+        user = User(username=username, password_hash=hash_password(password))
+        db.session.add(user)
+        db.session.commit()
+        add_log("auth", f"新用户注册: {username}", user.id)
+        flash("注册成功，请登录", "success")
+        return redirect(url_for("login"))
+
+    return render_template("register.html")
+
+
+@app.route("/logout")
+@login_required
+def logout():
+    add_log("auth", f"用户退出: {current_user.username}", current_user.id)
+    clear_runtime_after_logout()
+    logout_user()
+    flash("您已退出登录", "info")
+    return redirect(url_for("login"))
+
+
+@app.route("/relogin")
+@login_required
+def relogin():
+    if current_user.is_authenticated:
+        add_log("auth", f"用户重新登录: {current_user.username}", current_user.id)
+        clear_runtime_after_logout()
+        logout_user()
+    flash("请重新登录以继续", "info")
+    return redirect(url_for("login"))
+
+
+@app.post("/api/auth/logout")
+@login_required
+def api_logout():
+    add_log("auth", f"用户退出: {current_user.username}", current_user.id)
+    clear_runtime_after_logout()
+    logout_user()
+    return jsonify({"ok": True, "action": "logout", "redirect": url_for("login")})
+
+
+@app.post("/api/auth/relogin")
+@login_required
+def api_relogin():
+    add_log("auth", f"用户重新登录: {current_user.username}", current_user.id)
+    clear_runtime_after_logout()
+    logout_user()
+    return jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")})
+
+
+@app.route("/profile")
+@login_required
+def profile_page():
+    return render_template("profile.html")
+
+
+@app.route("/monitor")
+@login_required
+def monitor():
+    return render_template("monitor.html")
+
+
+@app.route("/stats")
+@login_required
+def stats_page():
+    return render_template("stats.html")
+
+
+@app.route("/history")
+@login_required
+def history_page():
+    return render_template("history.html")
+
+
+@app.route("/admin")
+@login_required
+def admin_page():
+    if not current_user.is_admin:
+        flash("只有管理员可以访问该页面", "warning")
+        return redirect(url_for("monitor"))
+    return render_template("admin.html")
+
+
+@app.get("/api/camera/status")
+@login_required
+def camera_status():
+    connected = sync_camera_state()
+
+    if runtime_state["camera_type"] == "openmv":
+        if runtime_state["openmv_connected"] and runtime_state["camera_on"]:
+            text = "已连接"
+            phase = "running"
+        elif runtime_state["openmv_connected"]:
+            text = "设备已连(待开启)"
+            phase = "ready"
+        else:
+            text = "离线"
+            phase = "offline"
+    else:
+        text = "已连接" if runtime_state["camera_on"] else "离线"
+        phase = "running" if runtime_state["camera_on"] else "offline"
+
+
+    return jsonify(
+        {
+            "ok": True,
+            "status": "connected" if connected else "disconnected",
+            "connected": connected,
+
+            "text": text,
+            "phase": phase,
+
+            "camera_on": runtime_state["camera_on"],
+            "camera_state": runtime_state["camera_state"],
+            "camera_type": runtime_state["camera_type"],
+            "openmv_connected": runtime_state["openmv_connected"],
+        }
+    )
+
+
+@app.get("/api/system/status")
+@login_required
+def system_status():
+    model_service.ensure_loaded(cooldown_sec=3.0)
+    sync_camera_state()
+    camera_state = runtime_state["camera_state"] if runtime_state["camera_on"] else "未连接"
+    return jsonify(
+        {
+            "ok": True,
+            "camera_on": runtime_state["camera_on"],
+            "camera_state": camera_state,
+            "detection_on": runtime_state["detection_on"],
+            "camera_type": runtime_state["camera_type"],
+            "openmv_connected": runtime_state["openmv_connected"],
+            "openmv_mode": runtime_state["openmv_mode"],
+            "openmv_target": runtime_state["openmv_target"],
+            "openmv_settings": openmv_settings,
+            "last_detection_time": runtime_state["last_detection_time"],
+            "camera_started_at": runtime_state["camera_started_at"],
+            "last_inference_ms": runtime_state["last_inference_ms"],
+            "today_detection_seconds": get_today_detection_seconds(),
+            "model_name": model_service.model_name,
+            "model_path": str(model_service.model_path),
+            "model_loaded": bool(model_service.model),
+            "model_error": model_service.last_error,
+
+            "server_time": bjt_now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
+@app.post("/api/model/reload")
+@login_required
+def reload_model():
+    ok, message = model_service.reload()
+    code = 200 if ok else 400
+    return jsonify(
+        {
+            "ok": ok,
+            "message": message,
+            "model_name": model_service.model_name,
+            "model_path": str(model_service.model_path),
+            "model_loaded": bool(model_service.model),
+            "model_error": model_service.last_error,
+        }
+    ), code
+
+
+@app.get("/api/openmv/ports")
+@login_required
+def openmv_ports():
+    ports = []
+    if list_ports:
+        ports = [p.device for p in list_ports.comports()]
+    if not ports:
+        ports = ["COM3", "COM4", "/dev/ttyUSB0"]
+    return jsonify({"ok": True, "ports": ports})
+
+
+@app.post("/api/openmv/connect")
+@login_required
+def openmv_connect():
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get("mode", "serial")
+    target = (payload.get("target") or "").strip()
+    if not target:
+        return jsonify({"ok": False, "message": "请填写串口号或 IP 地址"}), 400
+
+    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
+    openmv_serial_buffer = bytearray()
+    openmv_network_buffer = bytearray()
+
+    if mode == "serial":
+        if openmv_network_conn:
+            try:
+                openmv_network_conn.close()
+            except Exception:
+                pass
+            openmv_network_conn = None
+        if not serial:
+            return jsonify({"ok": False, "message": "缺少 pyserial 依赖"}), 500
+        try:
+            openmv_serial_conn = serial.Serial(target, baudrate=openmv_settings["baudrate"], timeout=openmv_settings["serial_timeout"] / 1000)
+        except Exception as exc:
+            runtime_state["openmv_connected"] = False
+            runtime_state["camera_state"] = "未连接"
+            return jsonify({"ok": False, "message": f"串口连接失败: {exc}"}), 400
+    elif mode == "network":
+        if openmv_serial_conn:
+            try:
+                openmv_serial_conn.close()
+            except Exception:
+                pass
+            openmv_serial_conn = None
+
+        if target.startswith("http://") or target.startswith("https://"):
+            pass
+        else:
+            match = re.match(r"^([^:]+):(\d+)$", target)
+            if not match:
+                return jsonify({"ok": False, "message": "网络模式目标格式需为 http(s)://... 或 IP:PORT"}), 400
+            host, port_str = match.groups()
+            try:
+                openmv_network_conn = socket.create_connection((host, int(port_str)), timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5))
+                openmv_network_conn.settimeout(max(openmv_settings["serial_timeout"] / 1000, 0.5))
+            except Exception as exc:
+                runtime_state["openmv_connected"] = False
+                runtime_state["camera_state"] = "未连接"
+                return jsonify({"ok": False, "message": f"网络连接失败: {exc}"}), 400
+    else:
+        return jsonify({"ok": False, "message": "不支持的连接方式"}), 400
+
+    runtime_state["camera_state"] = "已连接"
+    runtime_state["openmv_connected"] = True
+    runtime_state["openmv_mode"] = mode
+    runtime_state["openmv_target"] = target
+    runtime_state["camera_type"] = "openmv"
+    add_log("device", f"OpenMV 已连接: {mode} {target}", current_user.id)
+    return jsonify({"ok": True, "status": "connected", "mode": mode, "target": target, "baudrate": openmv_settings["baudrate"]})
+
+
+@app.post("/api/openmv/disconnect")
+@login_required
+def openmv_disconnect():
+    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
+    if openmv_serial_conn:
+        try:
+            openmv_serial_conn.close()
+        except Exception:
+            pass
+        openmv_serial_conn = None
+    if openmv_network_conn:
+        try:
+            openmv_network_conn.close()
+        except Exception:
+            pass
+        openmv_network_conn = None
+    openmv_serial_buffer = bytearray()
+    openmv_network_buffer = bytearray()
+    runtime_state["openmv_connected"] = False
+    runtime_state["camera_state"] = "未连接"
+    runtime_state["openmv_target"] = ""
+    if runtime_state["camera_type"] == "openmv":
+        runtime_state["camera_on"] = False
+        runtime_state["detection_on"] = False
+        runtime_state["camera_started_at"] = None
+    add_log("device", "OpenMV 已断开", current_user.id)
+    return jsonify({"ok": True, "status": "disconnected"})
+
+
+@app.post("/api/openmv/settings")
+@login_required
+def update_openmv_settings():
+    payload = request.get_json(silent=True) or {}
+    camera_type = (payload.get("camera_type") or runtime_state.get("camera_type") or "local").strip().lower()
+    if camera_type in {"local", "openmv"}:
+        runtime_state["camera_type"] = camera_type
+    openmv_settings["camera_id"] = int(payload.get("camera_id", openmv_settings.get("camera_id", 0)))
+    openmv_settings["resolution"] = payload.get("resolution", openmv_settings["resolution"])
+    openmv_settings["fps"] = int(payload.get("fps", openmv_settings["fps"]))
+    openmv_settings["baudrate"] = int(payload.get("baudrate", openmv_settings["baudrate"]))
+    openmv_settings["flip_horizontal"] = bool(payload.get("flip_horizontal", openmv_settings["flip_horizontal"]))
+    openmv_settings["flip_vertical"] = bool(payload.get("flip_vertical", openmv_settings["flip_vertical"]))
+    openmv_settings["exposure"] = int(payload.get("exposure", openmv_settings["exposure"]))
+    openmv_settings["gain"] = float(payload.get("gain", openmv_settings["gain"]))
+    openmv_settings["auto_white_balance"] = bool(payload.get("auto_white_balance", openmv_settings["auto_white_balance"]))
+    openmv_settings["serial_timeout"] = int(payload.get("serial_timeout", openmv_settings["serial_timeout"]))
+    global openmv_serial_conn
+    if openmv_serial_conn and openmv_serial_conn.is_open:
+        openmv_serial_conn.baudrate = openmv_settings["baudrate"]
+        openmv_serial_conn.timeout = openmv_settings["serial_timeout"] / 1000
+    set_config_json("openmv_settings", openmv_settings)
+    add_log("device", f"更新 OpenMV 配置: {openmv_settings}", current_user.id)
+    return jsonify({"ok": True, "settings": openmv_settings})
+
+
+@app.post("/api/camera/start")
+@login_required
+def start_camera():
+    payload = request.get_json(silent=True) or {}
+    camera_type = payload.get("camera_type", "local")
+    if camera_type == "openmv" and not runtime_state["openmv_connected"]:
+        return jsonify({"ok": False, "message": "OpenMV 未连接，请先连接设备"}), 400
+
+    runtime_state["camera_type"] = camera_type
+    model_service.ensure_loaded(cooldown_sec=0.0)
+    runtime_state["camera_on"] = True
+    runtime_state["detection_on"] = bool(model_service.model)
+    runtime_state["camera_state"] = "已连接"
+    if runtime_state["camera_started_at"] is None:
+        runtime_state["camera_started_at"] = time.time()
+
+    add_log("device", f"摄像头已开启({camera_type})并自动开始检测", current_user.id)
+    return jsonify(
+        {
+            "ok": True,
+            "camera_on": True,
+            "camera_type": camera_type,
+
+            "detection_on": runtime_state["detection_on"],
+            "model_loaded": bool(model_service.model),
+            "model_error": model_service.last_error,
+            "message": "",
+
+        }
+    )
+
+
+@app.post("/api/camera/stop")
+@login_required
+def stop_camera():
+    if runtime_state["camera_started_at"]:
+        start_dt = datetime.utcfromtimestamp(runtime_state["camera_started_at"])
+        add_duration_seconds(start_dt, datetime.utcnow())
+    runtime_state["camera_on"] = False
+    runtime_state["detection_on"] = False
+    runtime_state["camera_state"] = "未连接"
+    runtime_state["camera_started_at"] = None
+    runtime_state["last_inference_ms"] = 0
+    if runtime_state["camera_type"] == "openmv":
+        runtime_state["openmv_connected"] = False
+        runtime_state["openmv_target"] = ""
+    add_log("device", "摄像头已关闭", current_user.id)
+    return jsonify({"ok": True, "camera_on": False})
+
+
+@app.post("/api/detection/start")
+@login_required
+def start_detection():
+    if not runtime_state["camera_on"]:
+        return jsonify({"ok": False, "message": "请先打开摄像头"}), 400
+
+    runtime_state["detection_on"] = True
+    add_log("detection", "目标检测已开启", current_user.id)
+    return jsonify({"ok": True, "detection_on": True})
+
+
+@app.post("/api/detection/stop")
+@login_required
+def stop_detection():
+    runtime_state["detection_on"] = False
+    add_log("detection", "目标检测已停止", current_user.id)
+    return jsonify({"ok": True, "detection_on": False})
+
+
+@app.route("/api/detection/frame-data", methods=["GET", "POST"])
+@login_required
+def frame_data():
+    if not runtime_state["camera_on"]:
+        return jsonify({"ok": False, "message": "摄像头未开启", "boxes": [], "counts": {}})
+
+    if not runtime_state["detection_on"]:
+        return jsonify({"ok": True, "boxes": [], "counts": {}, "detection_on": False})
+    model_service.ensure_loaded(cooldown_sec=0.0)
+    if not model_service.model:
+
+        return jsonify({"ok": True, "boxes": [], "counts": {}, "detection_on": True})
+
+
+    payload = request.get_json(silent=True) or {}
+    frame_meta = {"source": runtime_state["camera_type"], "openmv": openmv_settings}
+    frame_b64 = (payload.get("frame") or "").strip()
+    frame_provided = bool(frame_b64)
+    if frame_b64:
+        if "," in frame_b64:
+            frame_b64 = frame_b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(frame_b64)
+            if cv2 is not None:
+                npbuf = np.frombuffer(raw, dtype=np.uint8)
+                frame = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    frame_meta["frame_array"] = frame
+        except Exception:
+            pass
+    if frame_provided and "frame_array" not in frame_meta:
+
+        try:
+            raw = base64.b64decode(frame_b64)
+            if Image is not None:
+                from io import BytesIO
+
+                frame = np.array(Image.open(BytesIO(raw)).convert("RGB"))
+                if frame is not None and frame.size > 0:
+                    frame_meta["frame_array"] = frame
+        except Exception:
+            pass
+
+    if frame_provided and "frame_array" not in frame_meta:
+
+        return jsonify({"ok": False, "message": "摄像头帧解析失败，请检查图像编码格式", "boxes": [], "counts": {}})
+
+    infer_start = time.perf_counter()
+    result = model_service.predict_from_frame(frame_meta=frame_meta)
+    runtime_state["last_inference_ms"] = round((time.perf_counter() - infer_start) * 1000, 2)
+    runtime_state["last_detection_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    for category, count in result["counts"].items():
+        avg_conf = sum(b["conf"] for b in result["boxes"] if b["label"] == category) / count
+        db.session.add(
+            DetectionRecord(
+                user_id=current_user.id,
+                category=category,
+                count=count,
+                confidence=round(avg_conf, 2),
+                operator_name=current_user.username,
+                operation_type="目标检测",
+            )
+        )
+    db.session.commit()
+
+    return jsonify({"ok": True, **result, "detection_on": True})
+
+
+@app.get("/api/stats/live")
+@login_required
+def live_stats():
+    now = datetime.utcnow()
+    today_start = datetime(now.year, now.month, now.day)
+    today_records = scoped_detection_query().filter(DetectionRecord.detect_time >= today_start).all()
+
+    total_events = len(today_records)
+    total_objects = sum(r.count for r in today_records)
+    category_counter = Counter()
+    for r in today_records:
+        category_counter[r.category] += r.count
+
+    hourly = [0] * 24
+    for r in today_records:
+        hourly[r.detect_time.hour] += r.count
+
+    timeline_window_start = now - timedelta(minutes=1)
+    recent_records = scoped_detection_query().filter(DetectionRecord.detect_time >= timeline_window_start).all()
+    sec_bucket = Counter()
+    for record in recent_records:
+        sec_bucket[record.detect_time.strftime("%H:%M:%S")] += record.count
+    timeline = []
+    for i in range(20):
+        t = now - timedelta(seconds=(19 - i) * 3)
+        key = t.strftime("%H:%M:%S")
+        timeline.append({"time": key, "value": sec_bucket.get(key, 0)})
+
+    return jsonify(
+        {
+            "ok": True,
+            "cards": {
+                "today_events": total_events,
+                "today_objects": total_objects,
+                "active_users": User.query.filter(
+                    User.is_active_account.is_(True),
+                    User.last_login_at.isnot(None),
+                    User.last_login_at >= now - timedelta(minutes=5),
+                ).count(),
+                "camera_type": runtime_state["camera_type"],
+                "resolution": openmv_settings["resolution"],
+                "fps": openmv_settings["fps"],
+                "inference_ms": runtime_state["last_inference_ms"],
+                "camera_on": runtime_state["camera_on"],
+                "camera_state": runtime_state["camera_state"],
+                "openmv_settings": openmv_settings,
+            },
+            "series_meta": {
+                "categories": sorted(list(category_counter.keys())),
+                "total": total_objects,
+            },
+            "line": timeline,
+            "pie": [{"name": k, "value": v} for k, v in category_counter.items()],
+            "bar": hourly,
+        }
+    )
+
+
+@app.get("/api/stats/advanced")
+@login_required
+def advanced_stats():
+    range_key = request.args.get("range", "today")
+    start_time = request.args.get("start_time", "")
+    end_time = request.args.get("end_time", "")
+    categories = [c.strip() for c in request.args.get("categories", "").split(",") if c.strip()]
+
+    start, end = parse_time_range(range_key, start_time, end_time)
+    if not start or not end:
+        return jsonify({"ok": False, "message": "自定义时间格式错误"}), 400
+
+    records = scoped_detection_query().filter(
+        DetectionRecord.detect_time >= start,
+        DetectionRecord.detect_time <= end,
+    )
+    if categories:
+        records = records.filter(DetectionRecord.category.in_(categories))
+    records = records.all()
+
+    total = sum(r.count for r in records)
+    cate = Counter()
+    timeline = []
+    grouped = Counter()
+    for r in records:
+        cate[r.category] += r.count
+        key = r.detect_time.strftime("%Y-%m-%d %H:%M")
+        grouped[key] += r.count
+    for key in sorted(grouped.keys())[-100:]:
+        timeline.append({"time": key, "value": grouped[key], "dist": dict(cate)})
+
+    bar_data = []
+    for name, value in cate.items():
+        bar_data.append({"name": name, "value": value})
+
+    return jsonify(
+        {
+            "ok": True,
+            "timeline": timeline,
+            "pie": [{"name": n, "value": v} for n, v in cate.items()],
+            "bar": bar_data,
+            "categories": sorted(list({r.category for r in scoped_detection_query().all()})),
+            "total": total,
+            "range": {"start": start.isoformat(sep=" "), "end": end.isoformat(sep=" ")},
+        }
+    )
+
+
+@app.get("/api/stats/export")
+@login_required
+def export_stats():
+    fmt = request.args.get("format", "csv").lower()
+    query = scoped_detection_query()
+    keyword = request.args.get("keyword", "").strip()
+    category = request.args.get("category", "").strip()
+    note = request.args.get("note", "").strip()
+    start_time = request.args.get("start_time", "").strip()
+    end_time = request.args.get("end_time", "").strip()
+
+    if keyword:
+        query = query.filter((DetectionRecord.category.contains(keyword)) | (DetectionRecord.note.contains(keyword)))
+    if category:
+        query = query.filter_by(category=category)
+    if note:
+        query = query.filter(DetectionRecord.note.contains(note))
+    if start_time:
+        try:
+            query = query.filter(DetectionRecord.detect_time >= datetime.fromisoformat(start_time))
+        except ValueError:
+            pass
+    if end_time:
+        try:
+            query = query.filter(DetectionRecord.detect_time <= datetime.fromisoformat(end_time))
+        except ValueError:
+            pass
+
+    records = query.order_by(DetectionRecord.detect_time.desc()).limit(3000).all()
+    rows = [
+        {
+            "id": r.id,
+            "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "category": r.category,
+            "count": r.count,
+            "confidence": r.confidence,
+            "operator": r.operator_name,
+            "operation_type": r.operation_type,
+        }
+        for r in records
+    ]
+
+    if fmt == "json":
+        return jsonify({"ok": True, "data": rows})
+
+    if fmt == "excel":
+        lines = ["ID\t时间\t类别\t数量\t置信度"]
+        for r in rows:
+            lines.append(f"{r['id']}\t{r['time']}\t{r['category']}\t{r['count']}\t{r['confidence']}")
+        content = "\n".join(lines)
+        mimetype = "application/vnd.ms-excel"
+        suffix = "xls"
+    else:
+        lines = ["id,time,category,count,confidence"]
+        for r in rows:
+            lines.append(f"{r['id']},{r['time']},{r['category']},{r['count']},{r['confidence']}")
+        content = "\n".join(lines)
+        mimetype = "text/csv"
+        suffix = "csv"
+
+    return Response(
+        content,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f"attachment; filename=stats_export.{suffix}"},
+    )
+
+
+@app.delete("/api/admin/history")
+@login_required
+def clear_history():
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    DetectionRecord.query.delete()
+    db.session.commit()
+    add_log("admin", "管理员清空全部检测记录", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/history")
+@login_required
+def get_history():
+    query = scoped_detection_query()
+    keyword = request.args.get("keyword", "").strip()
+    category = request.args.get("category", "").strip()
+    note = request.args.get("note", "").strip()
+    start_time = request.args.get("start_time", "").strip()
+    end_time = request.args.get("end_time", "").strip()
+    page = max(int(request.args.get("page", 1)), 1)
+    page_size = min(max(int(request.args.get("page_size", 20)), 1), 100)
+
+    if keyword:
+        query = query.filter((DetectionRecord.category.contains(keyword)) | (DetectionRecord.note.contains(keyword)))
+    if category:
+        query = query.filter_by(category=category)
+    if note:
+        query = query.filter(DetectionRecord.note.contains(note))
+    if start_time:
+        try:
+            query = query.filter(DetectionRecord.detect_time >= datetime.fromisoformat(start_time))
+        except ValueError:
+            pass
+    if end_time:
+        try:
+            query = query.filter(DetectionRecord.detect_time <= datetime.fromisoformat(end_time))
+        except ValueError:
+            pass
+
+    total = query.count()
+    records = (
+        query.order_by(DetectionRecord.detect_time.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    data = [
+        {
+            "id": r.id,
+            "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "category": r.category,
+            "count": r.count,
+            "confidence": r.confidence,
+            "operator": r.operator_name,
+            "operation_type": r.operation_type,
+        }
+        for r in records
+    ]
+    return jsonify({"ok": True, "records": data, "total": total, "page": page, "page_size": page_size})
+
+
+@app.get("/api/admin/overview")
+@login_required
+def admin_overview():
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+
+    users = User.query.order_by(User.created_at.desc()).all()
+    offset = max(int(request.args.get("offset", 0)), 0)
+    limit = min(max(int(request.args.get("limit", 50)), 1), 100)
+    operator_filter = request.args.get("operator", "").strip()
+    log_query = SystemLog.query
+    if operator_filter:
+        log_query = log_query.filter(SystemLog.operator.contains(operator_filter))
+    logs = log_query.order_by(SystemLog.created_at.desc()).offset(offset).limit(limit).all()
+
+    return jsonify(
+        {
+            "ok": True,
+            "users": [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "is_admin": u.is_admin,
+                    "status": "启用" if u.is_active_account else "禁用",
+                    "email": u.email,
+                    "phone": u.phone,
+                    "avatar_url": u.avatar_url,
+                    "created_at": safe_fmt_dt(u.created_at),
+                    "last_login_at": safe_fmt_dt(u.last_login_at),
+                }
+                for u in users
+            ],
+            "metrics": {
+                "user_count": User.query.count(),
+                "history_total": DetectionRecord.query.count(),
+                "history_total_desc": "累计检测记录=系统中累计保存的检测记录条数",
+                "camera_on": runtime_state["camera_on"],
+                "camera_state": runtime_state["camera_state"],
+                "detection_on": runtime_state["detection_on"],
+                "today_logs": db.session.query(func.count(SystemLog.id))
+                .filter(SystemLog.created_at >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0))
+                .scalar(),
+            },
+            "logs": [
+                {
+                    "time": safe_fmt_dt(l.created_at),
+                    "operator": l.operator,
+                    "ip": l.ip,
+                    "content": l.content,
+                    "result": l.result,
+                }
+                for l in logs
+            ],
+        }
+    )
+
+
+@app.delete("/api/admin/history/<int:record_id>")
+@login_required
+def delete_history(record_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+
+    record = DetectionRecord.query.get_or_404(record_id)
+    db.session.delete(record)
+    db.session.commit()
+    add_log("admin", f"管理员删除历史记录 ID={record_id}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/history/<int:record_id>")
+@login_required
+def delete_history_self(record_id: int):
+    record = DetectionRecord.query.get_or_404(record_id)
+    if (not current_user.is_admin) and record.user_id != current_user.id:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    db.session.delete(record)
+    db.session.commit()
+    add_log("history", f"删除历史记录 ID={record_id}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/user/<int:user_id>/reset-password")
+@login_required
+def reset_user_password(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    user.password_hash = hash_password("12345678")
+    db.session.commit()
+    add_log("admin", f"重置用户密码: {user.username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/user/<int:user_id>/role")
+@login_required
+def update_user_role(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    payload = request.get_json(silent=True) or {}
+    user.is_admin = bool(payload.get("is_admin", False))
+    db.session.commit()
+    add_log("admin", f"修改用户角色: {user.username}=>{'管理员' if user.is_admin else '普通用户'}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/user/<int:user_id>/status")
+@login_required
+def update_user_status(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    payload = request.get_json(silent=True) or {}
+    user.is_active_account = bool(payload.get("is_active", True))
+    db.session.commit()
+    add_log("admin", f"修改用户状态: {user.username}=>{'启用' if user.is_active_account else '禁用'}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/users")
+@login_required
+def create_user():
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    if not username or len(password) < 6:
+        return jsonify({"ok": False, "message": "用户名不能为空且密码至少6位"}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify({"ok": False, "message": "用户名已存在"}), 400
+    user = User(
+        username=username,
+        password_hash=hash_password(password),
+        email=(payload.get("email") or "").strip(),
+        phone=(payload.get("phone") or "").strip(),
+        avatar_url=(payload.get("avatar_url") or "").strip(),
+        is_admin=bool(payload.get("is_admin", False)),
+    )
+    db.session.add(user)
+    db.session.commit()
+    add_log("admin", f"新增用户: {username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.put("/api/admin/users/<int:user_id>")
+@login_required
+def update_user(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or user.username).strip()
+    duplicate = User.query.filter(User.username == username, User.id != user.id).first()
+    if duplicate:
+        return jsonify({"ok": False, "message": "用户名已存在"}), 400
+    user.username = username
+    user.email = (payload.get("email") or "").strip()
+    user.phone = (payload.get("phone") or "").strip()
+    user.avatar_url = (payload.get("avatar_url") or "").strip()
+    user.is_admin = bool(payload.get("is_admin", user.is_admin))
+    user.is_active_account = bool(payload.get("is_active", user.is_active_account))
+    db.session.commit()
+    add_log("admin", f"更新用户信息: {user.username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/admin/users/<int:user_id>")
+@login_required
+def remove_user(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    if user.id == current_user.id:
+        return jsonify({"ok": False, "message": "不能删除当前登录管理员"}), 400
+    username = user.username
+    db.session.delete(user)
+    db.session.commit()
+    add_log("admin", f"删除用户: {username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/users/<int:user_id>/password")
+@login_required
+def update_user_password(user_id: int):
+    if not current_user.is_admin:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    user = User.query.get_or_404(user_id)
+    payload = request.get_json(silent=True) or {}
+    password = payload.get("password") or ""
+    if len(password) < 6:
+        return jsonify({"ok": False, "message": "密码长度至少6位"}), 400
+    user.password_hash = hash_password(password)
+    db.session.commit()
+    add_log("admin", f"管理员修改用户密码: {user.username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/account/me")
+@login_required
+def account_me():
+    return jsonify(
+        {
+            "ok": True,
+            "user": {
+                "id": current_user.id,
+                "username": current_user.username,
+                "email": current_user.email,
+                "phone": current_user.phone,
+                "avatar_url": current_user.avatar_url,
+                "is_admin": current_user.is_admin,
+                "created_at": current_user.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+    )
+
+
+@app.post("/api/account/profile")
+@login_required
+def update_account_profile():
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or current_user.username).strip()
+    duplicate = User.query.filter(User.username == username, User.id != current_user.id).first()
+    if duplicate:
+        return jsonify({"ok": False, "message": "用户名已存在"}), 400
+    current_user.username = username
+    current_user.email = (payload.get("email") or "").strip()
+    current_user.phone = (payload.get("phone") or "").strip()
+    current_user.avatar_url = (payload.get("avatar_url") or "").strip()
+    db.session.commit()
+    add_log("account", f"用户更新个人信息: {current_user.username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/account/password")
+@login_required
+def update_account_password():
+    payload = request.get_json(silent=True) or {}
+    old_password = payload.get("old_password") or ""
+    new_password = payload.get("new_password") or ""
+    if not verify_password(current_user.password_hash, old_password):
+        return jsonify({"ok": False, "message": "旧密码错误"}), 400
+    if len(new_password) < 6:
+        return jsonify({"ok": False, "message": "新密码长度至少6位"}), 400
+    current_user.password_hash = hash_password(new_password)
+    db.session.commit()
+    add_log("account", f"用户修改密码: {current_user.username}", current_user.id)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/history/<int:record_id>")
+@login_required
+def history_detail(record_id: int):
+    r = DetectionRecord.query.get_or_404(record_id)
+    if (not current_user.is_admin) and r.user_id != current_user.id:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    return jsonify({"ok": True, "record": {"id": r.id, "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"), "category": r.category, "count": r.count, "confidence": r.confidence, "operator": r.operator_name, "operation_type": r.operation_type, "note": r.note}})
+
+
+@app.get("/api/openmv/frame")
+@login_required
+def openmv_frame():
+    if not runtime_state["camera_on"] or runtime_state["camera_type"] != "openmv":
+        return jsonify({"ok": False, "message": "摄像头未开启"}), 400
+    frame = b""
+    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
+    if runtime_state["openmv_mode"] == "serial" and openmv_serial_conn and openmv_serial_conn.is_open:
+        try:
+            raw = openmv_serial_conn.read(8192)
+            if raw:
+                openmv_serial_buffer.extend(raw)
+                frame = extract_jpeg_frame(openmv_serial_buffer)
+        except Exception as exc:
+            runtime_state["camera_state"] = "未连接"
+            runtime_state["openmv_connected"] = False
+            return jsonify({"ok": False, "message": f"串口读取失败: {exc}"}), 400
+
+    if runtime_state["openmv_mode"] == "network" and runtime_state["openmv_target"]:
+        target = runtime_state["openmv_target"]
+        try:
+            if target.startswith("http://") or target.startswith("https://"):
+                with urllib.request.urlopen(target, timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5)) as resp:
+                    chunk = resp.read(65536)
+                openmv_network_buffer.extend(chunk)
+                frame = extract_jpeg_frame(openmv_network_buffer)
+                if not frame and b"\xff\xd8" in chunk and b"\xff\xd9" in chunk:
+                    s = chunk.find(b"\xff\xd8")
+                    e = chunk.find(b"\xff\xd9", s + 2)
+                    if e > s:
+                        frame = chunk[s : e + 2]
+            else:
+                if not openmv_network_conn:
+                    host, port_str = target.rsplit(":", 1)
+                    openmv_network_conn = socket.create_connection((host, int(port_str)), timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5))
+                    openmv_network_conn.settimeout(max(openmv_settings["serial_timeout"] / 1000, 0.5))
+                raw = openmv_network_conn.recv(8192)
+                if raw:
+                    openmv_network_buffer.extend(raw)
+                    frame = extract_jpeg_frame(openmv_network_buffer)
+        except Exception as exc:
+            runtime_state["camera_state"] = "未连接"
+            runtime_state["openmv_connected"] = False
+            return jsonify({"ok": False, "message": f"网络视频流读取失败: {exc}"}), 400
+
+    if not frame:
+        return jsonify(
+            {
+                "ok": False,
+                "message": "未收到有效视频帧，请检查 OpenMV 脚本是否在发送 JPEG 帧，以及目标地址/端口是否正确",
+                "target": runtime_state["openmv_target"],
+                "mode": runtime_state["openmv_mode"],
+            }
+        ), 400
+    runtime_state["openmv_last_frame_at"] = datetime.utcnow()
+    runtime_state["openmv_last_len"] = len(frame)
+    runtime_state["camera_state"] = "已连接"
+    app.logger.info("OpenMV RX len=%s header=%s footer=%s", len(frame), frame[:2].hex(), frame[-2:].hex())
+    return jsonify({"ok": True, "encoding": "base64", "frame": base64.b64encode(frame).decode("ascii"), "len": len(frame), "header": frame[:2].hex(), "footer": frame[-2:].hex()})
+
+
+if __name__ == "__main__":
+    lan_ip = get_lan_ip()
+    print("Local:   http://127.0.0.1:5000")
+    print("All NIC: http://0.0.0.0:5000")
+    print(f"LAN:     http://{lan_ip}:5000")
+    app.run(host="0.0.0.0", port=5000, debug=True)

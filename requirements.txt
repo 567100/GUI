@@ -1,0 +1,39 @@
+# GUI_YOLOv5 unified requirements (pip)
+
+# Compatible target: Python 3.9/3.10 (Windows/Linux/macOS)
+
+# ===== Web/GUI service =====
+Flask>=3.0,<3.1
+Flask-Login>=0.6.3,<0.7
+Flask-SQLAlchemy>=3.1,<3.2
+Werkzeug>=3.0,<3.1
+pyserial>=3.5,<4
+gunicorn>=21,<23
+
+# ===== YOLOv5 core =====
+# NOTE:
+# - scipy 1.10.x requires numpy <1.27
+# - opencv-python 4.12.x on py>=3.9 prefers numpy>=2 and may conflict with scipy
+# So we pin a compatible pair for stable installation.
+numpy>=1.23.5,<1.27
+opencv-python>=4.8,<4.11
+Pillow>=9.0,<11
+PyYAML>=6.0,<7
+requests>=2.31,<3
+scipy>=1.10,<1.12
+
+torch==2.0.1
+torchvision==0.15.2
+tqdm>=4.64,<5
+thop>=0.1.1.post2209072238
+
+# ===== Training / visualization =====
+matplotlib>=3.7,<3.9
+pandas>=1.5,<2.3
+seaborn>=0.12,<0.14
+tensorboard>=2.14,<2.16
+
+# ===== Optional utilities =====
+gitpython>=3.1,<4
+psutil>=5.9,<8
+

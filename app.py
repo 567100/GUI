@@ -562,6 +562,7 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
+
         opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
         if not session.get("_fresh", True) and not opted_in_auto_login:
             logout_user()
@@ -573,6 +574,7 @@ def make_session_permanent():
 
         if opted_in_auto_login:
             session["remember_login"] = True
+
         session.permanent = bool(session.get("remember_login", False))
         token_in_session = session.get("auth_session_token")
         token_in_db = current_user.active_session_token

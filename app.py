@@ -21,6 +21,7 @@ from flask import (
     Response,
     flash,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -79,6 +80,8 @@ def resolve_database_uri() -> str:
 
 DB_URI = resolve_database_uri()
 IS_SQLITE = DB_URI.startswith("sqlite:")
+AUTO_LOGIN_COOKIE = "auto_login_opt_in"
+ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "15"))
 
 app = Flask(__name__)
 app.config.update(
@@ -310,6 +313,7 @@ def clear_bound_session(user: User | None) -> None:
             db.session.commit()
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
+    session.pop("remember_login", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -320,6 +324,14 @@ def clear_runtime_after_logout() -> None:
     runtime_state["camera_state"] = "未连接"
     runtime_state["openmv_connected"] = False
     runtime_state["camera_started_at"] = None
+
+
+def is_active_session_stale(user: User) -> bool:
+    if not user.is_logged_in or not user.active_session_token:
+        return True
+    if not user.last_login_at:
+        return True
+    return (datetime.utcnow() - user.last_login_at).total_seconds() > ACTIVE_SESSION_TIMEOUT_SECONDS
 
 
 def safe_fmt_dt(dt: datetime | None) -> str:
@@ -559,7 +571,18 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
-        session.permanent = True
+        opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
+        if not session.get("_fresh", True) and not opted_in_auto_login:
+            logout_user()
+            session.pop("auth_session_token", None)
+            session.pop("heartbeat_at", None)
+            session.pop("remember_login", None)
+            flash("登录状态已失效，请重新登录", "info")
+            return redirect(url_for("login"))
+
+        if opted_in_auto_login:
+            session["remember_login"] = True
+        session.permanent = bool(session.get("remember_login", False))
         token_in_session = session.get("auth_session_token")
         token_in_db = current_user.active_session_token
 
@@ -627,7 +650,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        remember = bool(request.form.get("remember", True))
+        remember = request.form.get("remember") == "on"
 
         try:
             user = User.query.filter_by(username=username).first()
@@ -636,16 +659,29 @@ def login():
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
                 if user.is_logged_in and user.active_session_token:
-                    flash("该账号已在别处登录，请先退出或稍后再试", "warning")
-                    add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
-                    return render_template("login.html")
+                    if is_active_session_stale(user):
+                        user.is_logged_in = False
+                        user.active_session_token = None
+                        db.session.commit()
+                        add_log("auth", f"检测到旧会话已过期，自动释放登录状态: {username}", user.id)
+                    else:
+                        flash("该账号已在别处登录，请先退出或稍后再试", "warning")
+                        add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
+                        return render_template("login.html")
 
                 login_user(user, remember=remember)
+                session["remember_login"] = remember
                 bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()
                 add_log("auth", f"用户登录: {username}", user.id)
-                return redirect(url_for("monitor"))
+                response = make_response(redirect(url_for("monitor")))
+                if remember:
+                    max_age = int(app.config["REMEMBER_COOKIE_DURATION"].total_seconds())
+                    response.set_cookie(AUTO_LOGIN_COOKIE, "1", max_age=max_age, httponly=True, samesite="Lax")
+                else:
+                    response.delete_cookie(AUTO_LOGIN_COOKIE)
+                return response
 
             flash("账号或密码错误", "danger")
         except Exception:
@@ -690,7 +726,9 @@ def logout():
     clear_bound_session(current_user)
     logout_user()
     flash("您已退出登录", "info")
-    return redirect(url_for("login"))
+    response = make_response(redirect(url_for("login")))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    return response
 
 
 @app.route("/relogin")
@@ -702,7 +740,9 @@ def relogin():
         clear_bound_session(current_user)
         logout_user()
     flash("请重新登录以继续", "info")
-    return redirect(url_for("login"))
+    response = make_response(redirect(url_for("login")))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    return response
 
 
 @app.post("/api/auth/logout")
@@ -712,7 +752,9 @@ def api_logout():
     clear_runtime_after_logout()
     clear_bound_session(current_user)
     logout_user()
-    return jsonify({"ok": True, "action": "logout", "redirect": url_for("login")})
+    response = make_response(jsonify({"ok": True, "action": "logout", "redirect": url_for("login")}))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    return response
 
 
 @app.post("/api/auth/relogin")
@@ -722,7 +764,9 @@ def api_relogin():
     clear_runtime_after_logout()
     clear_bound_session(current_user)
     logout_user()
-    return jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")})
+    response = make_response(jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")}))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    return response
 
 
 @app.route("/profile")

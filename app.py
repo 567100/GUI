@@ -82,7 +82,7 @@ DB_URI = resolve_database_uri()
 IS_SQLITE = DB_URI.startswith("sqlite:")
 AUTO_LOGIN_COOKIE = "auto_login_opt_in"
 
-ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "15"))
+ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "5"))
 
 
 app = Flask(__name__)
@@ -307,12 +307,10 @@ def bind_user_session(user: User) -> str:
 
 
 def clear_bound_session(user: User | None) -> None:
-    token_in_session = session.get("auth_session_token")
     if user:
-        if not token_in_session or user.active_session_token == token_in_session:
-            user.is_logged_in = False
-            user.active_session_token = None
-            db.session.commit()
+        user.is_logged_in = False
+        user.active_session_token = None
+        db.session.commit()
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
     session.pop("remember_login", None)
@@ -663,14 +661,21 @@ def login():
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
                 if user.is_logged_in and user.active_session_token:
-                    if is_active_session_stale(user):
+
+                    was_stale = is_active_session_stale(user)
+                    if was_stale:
+                        previous_token = user.active_session_token
+
                         user.is_logged_in = False
                         user.active_session_token = None
                         db.session.commit()
                         add_log("auth", f"检测到旧会话已过期，自动释放登录状态: {username}", user.id)
+
+                        app.logger.info("用户 %s 登录释放过期会话，旧token=%s", username, previous_token)
                     else:
-                        flash("该账号已在别处登录，请先退出或稍后再试", "warning")
-                        add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
+                        flash("该账号当前正在其他设备使用，请稍后再试", "warning")
+                        add_log("auth", f"登录被拒绝（账号在线且会话活跃）: {username}", user.id, result="失败")
+
                         return render_template("login.html")
 
                 login_user(user, remember=remember)

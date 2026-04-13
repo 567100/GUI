@@ -81,6 +81,15 @@ function showToast(message, type='success') {
   node.addEventListener('hidden.bs.toast', () => node.remove());
 }
 
+
+function handleAuthExpiryResponse(res, data=null) {
+  const expired = res.status === 401 || data?.code === 'SESSION_REPLACED' || data?.code === 'AUTH_INVALID';
+  if (!expired) return false;
+  const target = data?.redirect || '/login';
+  window.location.href = target;
+  return true;
+}
+
 function animateNumber(el, target, duration=700) {
   const start = Number(el.textContent) || 0;
   const diff = target - start;
@@ -98,7 +107,14 @@ async function refreshGlobalStatus() {
   if (!el) return;
   try {
     const res = await fetch('/api/camera/status');
-    const data = await res.json();
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (handleAuthExpiryResponse(res)) return;
+      throw e;
+    }
+    if (handleAuthExpiryResponse(res, data)) return;
     if (!data.ok) return;
     const connected = data.status === 'connected';
     const text = connected ? '已连接' : '离线';
@@ -125,8 +141,14 @@ async function refreshGlobalAvatar() {
   if (!el) return;
   try {
     const res = await fetch('/api/account/me');
-    if (!res.ok) return;
-    const data = await res.json();
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (handleAuthExpiryResponse(res)) return;
+      throw e;
+    }
+    if (handleAuthExpiryResponse(res, data)) return;
     if (!data.ok) return;
     const username = data.user?.username || '用户';
     const avatar = data.user?.avatar_url || buildAvatarDataUri(username);

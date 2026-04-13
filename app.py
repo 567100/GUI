@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import secrets
 
 import time
 import socket
@@ -118,6 +119,8 @@ class User(UserMixin, db.Model):
     phone = db.Column(db.String(30), nullable=False, default="")
     avatar_url = db.Column(db.String(255), nullable=False, default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_logged_in = db.Column(db.Boolean, nullable=False, default=False)
+    active_session_token = db.Column(db.String(128), nullable=True)
 
 
 class DetectionRecord(db.Model):
@@ -281,6 +284,32 @@ def hash_password(password: str) -> str:
 
 def verify_password(password_hash: str, password: str) -> bool:
     return check_password_hash(password_hash, password)
+
+
+
+
+def generate_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def bind_user_session(user: User) -> str:
+    token = generate_session_token()
+    user.is_logged_in = True
+    user.active_session_token = token
+    session["auth_session_token"] = token
+    session["heartbeat_at"] = int(time.time())
+    return token
+
+
+def clear_bound_session(user: User | None) -> None:
+    token_in_session = session.get("auth_session_token")
+    if user:
+        if not token_in_session or user.active_session_token == token_in_session:
+            user.is_logged_in = False
+            user.active_session_token = None
+            db.session.commit()
+    session.pop("auth_session_token", None)
+    session.pop("heartbeat_at", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -451,6 +480,12 @@ def init_db():
         if "avatar_url" not in user_columns:
             db.session.execute(text("ALTER TABLE user ADD COLUMN avatar_url VARCHAR(255) NOT NULL DEFAULT ''"))
             db.session.commit()
+        if "is_logged_in" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN is_logged_in BOOLEAN NOT NULL DEFAULT 0"))
+            db.session.commit()
+        if "active_session_token" not in user_columns:
+            db.session.execute(text("ALTER TABLE user ADD COLUMN active_session_token VARCHAR(128)"))
+            db.session.commit()
         ensure_column("detection_record", "operator_name", "VARCHAR(50) NOT NULL DEFAULT 'system'")
         ensure_column("detection_record", "operation_type", "VARCHAR(50) NOT NULL DEFAULT '目标检测'")
         ensure_column("detection_record", "note", "VARCHAR(255) NOT NULL DEFAULT ''")
@@ -525,6 +560,29 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 def make_session_permanent():
     if current_user.is_authenticated:
         session.permanent = True
+        token_in_session = session.get("auth_session_token")
+        token_in_db = current_user.active_session_token
+
+        if token_in_db and token_in_session and token_in_db != token_in_session:
+            logout_user()
+            session.pop("auth_session_token", None)
+            session.pop("heartbeat_at", None)
+            if request.path.startswith("/api/"):
+                return jsonify({"ok": False, "code": "AUTH_INVALID", "message": "当前会话无效，请重新登录", "redirect": url_for("login")}), 401
+            flash("当前会话无效，请重新登录", "warning")
+            return redirect(url_for("login"))
+
+        if not token_in_db and not token_in_session:
+            token_in_session = bind_user_session(current_user)
+            db.session.commit()
+        elif token_in_db and not token_in_session:
+            session["auth_session_token"] = token_in_db
+            token_in_session = token_in_db
+        elif token_in_session and not token_in_db:
+            current_user.is_logged_in = True
+            current_user.active_session_token = token_in_session
+            db.session.commit()
+
         now_ts = int(time.time())
         last_heartbeat = int(session.get("heartbeat_at", 0) or 0)
         if now_ts - last_heartbeat >= 60:
@@ -577,8 +635,13 @@ def login():
                 if not user.is_active_account:
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
+                if user.is_logged_in and user.active_session_token:
+                    flash("该账号已在别处登录，请先退出或稍后再试", "warning")
+                    add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
+                    return render_template("login.html")
 
                 login_user(user, remember=remember)
+                bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()
                 add_log("auth", f"用户登录: {username}", user.id)
@@ -624,6 +687,7 @@ def register():
 def logout():
     add_log("auth", f"用户退出: {current_user.username}", current_user.id)
     clear_runtime_after_logout()
+    clear_bound_session(current_user)
     logout_user()
     flash("您已退出登录", "info")
     return redirect(url_for("login"))
@@ -635,6 +699,7 @@ def relogin():
     if current_user.is_authenticated:
         add_log("auth", f"用户重新登录: {current_user.username}", current_user.id)
         clear_runtime_after_logout()
+        clear_bound_session(current_user)
         logout_user()
     flash("请重新登录以继续", "info")
     return redirect(url_for("login"))
@@ -645,6 +710,7 @@ def relogin():
 def api_logout():
     add_log("auth", f"用户退出: {current_user.username}", current_user.id)
     clear_runtime_after_logout()
+    clear_bound_session(current_user)
     logout_user()
     return jsonify({"ok": True, "action": "logout", "redirect": url_for("login")})
 
@@ -654,6 +720,7 @@ def api_logout():
 def api_relogin():
     add_log("auth", f"用户重新登录: {current_user.username}", current_user.id)
     clear_runtime_after_logout()
+    clear_bound_session(current_user)
     logout_user()
     return jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")})
 

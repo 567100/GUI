@@ -83,6 +83,7 @@ IS_SQLITE = DB_URI.startswith("sqlite:")
 AUTO_LOGIN_COOKIE = "auto_login_opt_in"
 
 ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "5"))
+ACTIVE_SESSION_HEARTBEAT_SECONDS = int(os.getenv("ACTIVE_SESSION_HEARTBEAT_SECONDS", "2"))
 
 
 app = Flask(__name__)
@@ -610,7 +611,7 @@ def make_session_permanent():
 
         now_ts = int(time.time())
         last_heartbeat = int(session.get("heartbeat_at", 0) or 0)
-        if now_ts - last_heartbeat >= 60:
+        if now_ts - last_heartbeat >= ACTIVE_SESSION_HEARTBEAT_SECONDS:
             current_user.last_login_at = datetime.utcnow()
             db.session.commit()
             session["heartbeat_at"] = now_ts
@@ -673,7 +674,7 @@ def login():
 
                         app.logger.info("用户 %s 登录释放过期会话，旧token=%s", username, previous_token)
                     else:
-                        flash("该账号当前正在其他设备使用，请稍后再试", "warning")
+                        flash("当前账号已在其他设备登录，请稍后再试", "warning")
                         add_log("auth", f"登录被拒绝（账号在线且会话活跃）: {username}", user.id, result="失败")
 
                         return render_template("login.html")

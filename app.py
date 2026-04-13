@@ -82,6 +82,9 @@ DB_URI = resolve_database_uri()
 IS_SQLITE = DB_URI.startswith("sqlite:")
 AUTO_LOGIN_COOKIE = "auto_login_opt_in"
 
+ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "15"))
+
+
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.getenv("SECRET_KEY", "replace-this-with-a-long-random-secret"),
@@ -323,6 +326,14 @@ def clear_runtime_after_logout() -> None:
     runtime_state["camera_state"] = "未连接"
     runtime_state["openmv_connected"] = False
     runtime_state["camera_started_at"] = None
+
+
+def is_active_session_stale(user: User) -> bool:
+    if not user.is_logged_in or not user.active_session_token:
+        return True
+    if not user.last_login_at:
+        return True
+    return (datetime.utcnow() - user.last_login_at).total_seconds() > ACTIVE_SESSION_TIMEOUT_SECONDS
 
 
 def safe_fmt_dt(dt: datetime | None) -> str:
@@ -652,9 +663,15 @@ def login():
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
                 if user.is_logged_in and user.active_session_token:
-                    flash("该账号已在别处登录，请先退出或稍后再试", "warning")
-                    add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
-                    return render_template("login.html")
+                    if is_active_session_stale(user):
+                        user.is_logged_in = False
+                        user.active_session_token = None
+                        db.session.commit()
+                        add_log("auth", f"检测到旧会话已过期，自动释放登录状态: {username}", user.id)
+                    else:
+                        flash("该账号已在别处登录，请先退出或稍后再试", "warning")
+                        add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
+                        return render_template("login.html")
 
                 login_user(user, remember=remember)
                 session["remember_login"] = remember

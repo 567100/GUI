@@ -81,7 +81,9 @@ def resolve_database_uri() -> str:
 DB_URI = resolve_database_uri()
 IS_SQLITE = DB_URI.startswith("sqlite:")
 AUTO_LOGIN_COOKIE = "auto_login_opt_in"
+
 ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "5"))
+
 
 app = Flask(__name__)
 app.config.update(
@@ -569,6 +571,7 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
+
         opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
         if not session.get("_fresh", True) and not opted_in_auto_login:
             logout_user()
@@ -580,6 +583,7 @@ def make_session_permanent():
 
         if opted_in_auto_login:
             session["remember_login"] = True
+
         session.permanent = bool(session.get("remember_login", False))
         token_in_session = session.get("auth_session_token")
         token_in_db = current_user.active_session_token
@@ -657,17 +661,21 @@ def login():
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
                 if user.is_logged_in and user.active_session_token:
+
                     was_stale = is_active_session_stale(user)
                     if was_stale:
                         previous_token = user.active_session_token
+
                         user.is_logged_in = False
                         user.active_session_token = None
                         db.session.commit()
                         add_log("auth", f"检测到旧会话已过期，自动释放登录状态: {username}", user.id)
+
                         app.logger.info("用户 %s 登录释放过期会话，旧token=%s", username, previous_token)
                     else:
                         flash("该账号当前正在其他设备使用，请稍后再试", "warning")
                         add_log("auth", f"登录被拒绝（账号在线且会话活跃）: {username}", user.id, result="失败")
+
                         return render_template("login.html")
 
                 login_user(user, remember=remember)

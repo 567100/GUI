@@ -310,6 +310,7 @@ def clear_bound_session(user: User | None) -> None:
             db.session.commit()
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
+    session.pop("remember_login", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -559,7 +560,7 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
-        session.permanent = True
+        session.permanent = bool(session.get("remember_login", False))
         token_in_session = session.get("auth_session_token")
         token_in_db = current_user.active_session_token
 
@@ -627,7 +628,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        remember = bool(request.form.get("remember", True))
+        remember = request.form.get("remember") == "on"
 
         try:
             user = User.query.filter_by(username=username).first()
@@ -641,6 +642,7 @@ def login():
                     return render_template("login.html")
 
                 login_user(user, remember=remember)
+                session["remember_login"] = remember
                 bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()

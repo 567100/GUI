@@ -21,6 +21,7 @@ from flask import (
     Response,
     flash,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -79,6 +80,10 @@ def resolve_database_uri() -> str:
 
 DB_URI = resolve_database_uri()
 IS_SQLITE = DB_URI.startswith("sqlite:")
+AUTO_LOGIN_COOKIE = "auto_login_opt_in"
+REMEMBER_COOKIE_NAME = os.getenv("REMEMBER_COOKIE_NAME", "remember_token")
+ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "5"))
+ACTIVE_SESSION_HEARTBEAT_SECONDS = int(os.getenv("ACTIVE_SESSION_HEARTBEAT_SECONDS", "2"))
 
 app = Flask(__name__)
 app.config.update(
@@ -278,6 +283,10 @@ def to_bjt(dt: datetime) -> datetime:
     return dt + timedelta(hours=8)
 
 
+def from_bjt(dt: datetime) -> datetime:
+    return dt - timedelta(hours=8)
+
+
 def hash_password(password: str) -> str:
     return generate_password_hash(password)
 
@@ -302,14 +311,13 @@ def bind_user_session(user: User) -> str:
 
 
 def clear_bound_session(user: User | None) -> None:
-    token_in_session = session.get("auth_session_token")
     if user:
-        if not token_in_session or user.active_session_token == token_in_session:
-            user.is_logged_in = False
-            user.active_session_token = None
-            db.session.commit()
+        user.is_logged_in = False
+        user.active_session_token = None
+        db.session.commit()
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
+    session.pop("remember_login", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -322,10 +330,18 @@ def clear_runtime_after_logout() -> None:
     runtime_state["camera_started_at"] = None
 
 
+def is_active_session_stale(user: User) -> bool:
+    if not user.is_logged_in or not user.active_session_token:
+        return True
+    if not user.last_login_at:
+        return True
+    return (datetime.utcnow() - user.last_login_at).total_seconds() > ACTIVE_SESSION_TIMEOUT_SECONDS
+
+
 def safe_fmt_dt(dt: datetime | None) -> str:
     if not dt:
         return "-"
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return to_bjt(dt).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def is_camera_connected() -> bool:
@@ -531,35 +547,38 @@ init_db()
 
 
 def parse_time_range(range_key: str, start_time: str, end_time: str):
-    now = datetime.utcnow()
+    now_bjt = bjt_now()
     if range_key == "today":
-        start = datetime(now.year, now.month, now.day)
-        end = now
+        start_bjt = datetime(now_bjt.year, now_bjt.month, now_bjt.day)
+        end_bjt = now_bjt
     elif range_key == "yesterday":
-        start = datetime(now.year, now.month, now.day) - timedelta(days=1)
-        end = datetime(now.year, now.month, now.day) - timedelta(seconds=1)
+        start_bjt = datetime(now_bjt.year, now_bjt.month, now_bjt.day) - timedelta(days=1)
+        end_bjt = datetime(now_bjt.year, now_bjt.month, now_bjt.day) - timedelta(seconds=1)
     elif range_key == "7d":
-        start = now - timedelta(days=7)
-        end = now
+        start_bjt = now_bjt - timedelta(days=7)
+        end_bjt = now_bjt
     elif range_key == "30d":
-        start = now - timedelta(days=30)
-        end = now
+        start_bjt = now_bjt - timedelta(days=30)
+        end_bjt = now_bjt
     elif range_key == "custom":
         try:
-            start = datetime.fromisoformat(start_time)
-            end = datetime.fromisoformat(end_time)
+            start_bjt = datetime.fromisoformat(start_time)
+            end_bjt = datetime.fromisoformat(end_time)
         except (TypeError, ValueError):
             return None, None
     else:
-        start = now - timedelta(days=1)
-        end = now
-    return start, end
+        start_bjt = now_bjt - timedelta(days=1)
+        end_bjt = now_bjt
+    return from_bjt(start_bjt), from_bjt(end_bjt)
 
 
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
-        session.permanent = True
+        opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
+        if opted_in_auto_login:
+            session["remember_login"] = True
+        session.permanent = bool(session.get("remember_login", False))
         token_in_session = session.get("auth_session_token")
         token_in_db = current_user.active_session_token
 
@@ -585,7 +604,7 @@ def make_session_permanent():
 
         now_ts = int(time.time())
         last_heartbeat = int(session.get("heartbeat_at", 0) or 0)
-        if now_ts - last_heartbeat >= 60:
+        if now_ts - last_heartbeat >= ACTIVE_SESSION_HEARTBEAT_SECONDS:
             current_user.last_login_at = datetime.utcnow()
             db.session.commit()
             session["heartbeat_at"] = now_ts
@@ -627,7 +646,7 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        remember = bool(request.form.get("remember", True))
+        remember = request.form.get("remember") == "on"
 
         try:
             user = User.query.filter_by(username=username).first()
@@ -636,16 +655,33 @@ def login():
                     flash("账号已被禁用，请联系管理员", "danger")
                     return render_template("login.html")
                 if user.is_logged_in and user.active_session_token:
-                    flash("该账号已在别处登录，请先退出或稍后再试", "warning")
-                    add_log("auth", f"登录被拒绝（账号已在线）: {username}", user.id, result="失败")
-                    return render_template("login.html")
+                    was_stale = is_active_session_stale(user)
+                    if was_stale:
+                        previous_token = user.active_session_token
+                        user.is_logged_in = False
+                        user.active_session_token = None
+                        db.session.commit()
+                        add_log("auth", f"检测到旧会话已过期，自动释放登录状态: {username}", user.id)
+                        app.logger.info("用户 %s 登录释放过期会话，旧token=%s", username, previous_token)
+                    else:
+                        flash("当前账号已在其他设备登录，请稍后再试", "warning")
+                        add_log("auth", f"登录被拒绝（账号在线且会话活跃）: {username}", user.id, result="失败")
+                        return render_template("login.html")
 
                 login_user(user, remember=remember)
+                session["remember_login"] = remember
                 bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()
                 add_log("auth", f"用户登录: {username}", user.id)
-                return redirect(url_for("monitor"))
+                response = make_response(redirect(url_for("monitor")))
+                if remember:
+                    max_age = int(app.config["REMEMBER_COOKIE_DURATION"].total_seconds())
+                    response.set_cookie(AUTO_LOGIN_COOKIE, "1", max_age=max_age, httponly=True, samesite="Lax")
+                else:
+                    response.delete_cookie(AUTO_LOGIN_COOKIE)
+                    response.delete_cookie(REMEMBER_COOKIE_NAME)
+                return response
 
             flash("账号或密码错误", "danger")
         except Exception:
@@ -690,7 +726,10 @@ def logout():
     clear_bound_session(current_user)
     logout_user()
     flash("您已退出登录", "info")
-    return redirect(url_for("login"))
+    response = make_response(redirect(url_for("login")))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    response.delete_cookie(REMEMBER_COOKIE_NAME)
+    return response
 
 
 @app.route("/relogin")
@@ -702,7 +741,10 @@ def relogin():
         clear_bound_session(current_user)
         logout_user()
     flash("请重新登录以继续", "info")
-    return redirect(url_for("login"))
+    response = make_response(redirect(url_for("login")))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    response.delete_cookie(REMEMBER_COOKIE_NAME)
+    return response
 
 
 @app.post("/api/auth/logout")
@@ -712,7 +754,10 @@ def api_logout():
     clear_runtime_after_logout()
     clear_bound_session(current_user)
     logout_user()
-    return jsonify({"ok": True, "action": "logout", "redirect": url_for("login")})
+    response = make_response(jsonify({"ok": True, "action": "logout", "redirect": url_for("login")}))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    response.delete_cookie(REMEMBER_COOKIE_NAME)
+    return response
 
 
 @app.post("/api/auth/relogin")
@@ -722,7 +767,10 @@ def api_relogin():
     clear_runtime_after_logout()
     clear_bound_session(current_user)
     logout_user()
-    return jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")})
+    response = make_response(jsonify({"ok": True, "action": "relogin", "redirect": url_for("login")}))
+    response.delete_cookie(AUTO_LOGIN_COOKIE)
+    response.delete_cookie(REMEMBER_COOKIE_NAME)
+    return response
 
 
 @app.route("/profile")
@@ -1090,7 +1138,7 @@ def frame_data():
     infer_start = time.perf_counter()
     result = model_service.predict_from_frame(frame_meta=frame_meta)
     runtime_state["last_inference_ms"] = round((time.perf_counter() - infer_start) * 1000, 2)
-    runtime_state["last_detection_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    runtime_state["last_detection_time"] = bjt_now().strftime("%Y-%m-%d %H:%M:%S")
 
     for category, count in result["counts"].items():
         avg_conf = sum(b["conf"] for b in result["boxes"] if b["label"] == category) / count
@@ -1113,7 +1161,8 @@ def frame_data():
 @login_required
 def live_stats():
     now = datetime.utcnow()
-    today_start = datetime(now.year, now.month, now.day)
+    now_bjt = to_bjt(now)
+    today_start = from_bjt(datetime(now_bjt.year, now_bjt.month, now_bjt.day))
     today_records = scoped_detection_query().filter(DetectionRecord.detect_time >= today_start).all()
 
     total_events = len(today_records)
@@ -1124,16 +1173,16 @@ def live_stats():
 
     hourly = [0] * 24
     for r in today_records:
-        hourly[r.detect_time.hour] += r.count
+        hourly[to_bjt(r.detect_time).hour] += r.count
 
     timeline_window_start = now - timedelta(minutes=1)
     recent_records = scoped_detection_query().filter(DetectionRecord.detect_time >= timeline_window_start).all()
     sec_bucket = Counter()
     for record in recent_records:
-        sec_bucket[record.detect_time.strftime("%H:%M:%S")] += record.count
+        sec_bucket[to_bjt(record.detect_time).strftime("%H:%M:%S")] += record.count
     timeline = []
     for i in range(20):
-        t = now - timedelta(seconds=(19 - i) * 3)
+        t = now_bjt - timedelta(seconds=(19 - i) * 3)
         key = t.strftime("%H:%M:%S")
         timeline.append({"time": key, "value": sec_bucket.get(key, 0)})
 
@@ -1193,7 +1242,7 @@ def advanced_stats():
     grouped = Counter()
     for r in records:
         cate[r.category] += r.count
-        key = r.detect_time.strftime("%Y-%m-%d %H:%M")
+        key = to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M")
         grouped[key] += r.count
     for key in sorted(grouped.keys())[-100:]:
         timeline.append({"time": key, "value": grouped[key], "dist": dict(cate)})
@@ -1210,7 +1259,7 @@ def advanced_stats():
             "bar": bar_data,
             "categories": sorted(list({r.category for r in scoped_detection_query().all()})),
             "total": total,
-            "range": {"start": start.isoformat(sep=" "), "end": end.isoformat(sep=" ")},
+            "range": {"start": to_bjt(start).isoformat(sep=" "), "end": to_bjt(end).isoformat(sep=" ")},
         }
     )
 
@@ -1234,12 +1283,12 @@ def export_stats():
         query = query.filter(DetectionRecord.note.contains(note))
     if start_time:
         try:
-            query = query.filter(DetectionRecord.detect_time >= datetime.fromisoformat(start_time))
+            query = query.filter(DetectionRecord.detect_time >= from_bjt(datetime.fromisoformat(start_time)))
         except ValueError:
             pass
     if end_time:
         try:
-            query = query.filter(DetectionRecord.detect_time <= datetime.fromisoformat(end_time))
+            query = query.filter(DetectionRecord.detect_time <= from_bjt(datetime.fromisoformat(end_time)))
         except ValueError:
             pass
 
@@ -1247,7 +1296,7 @@ def export_stats():
     rows = [
         {
             "id": r.id,
-            "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "time": to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M:%S"),
             "category": r.category,
             "count": r.count,
             "confidence": r.confidence,
@@ -1313,12 +1362,12 @@ def get_history():
         query = query.filter(DetectionRecord.note.contains(note))
     if start_time:
         try:
-            query = query.filter(DetectionRecord.detect_time >= datetime.fromisoformat(start_time))
+            query = query.filter(DetectionRecord.detect_time >= from_bjt(datetime.fromisoformat(start_time)))
         except ValueError:
             pass
     if end_time:
         try:
-            query = query.filter(DetectionRecord.detect_time <= datetime.fromisoformat(end_time))
+            query = query.filter(DetectionRecord.detect_time <= from_bjt(datetime.fromisoformat(end_time)))
         except ValueError:
             pass
 
@@ -1333,7 +1382,7 @@ def get_history():
     data = [
         {
             "id": r.id,
-            "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "time": to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M:%S"),
             "category": r.category,
             "count": r.count,
             "confidence": r.confidence,
@@ -1385,7 +1434,7 @@ def admin_overview():
                 "camera_state": runtime_state["camera_state"],
                 "detection_on": runtime_state["detection_on"],
                 "today_logs": db.session.query(func.count(SystemLog.id))
-                .filter(SystemLog.created_at >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0))
+                .filter(SystemLog.created_at >= from_bjt(datetime(bjt_now().year, bjt_now().month, bjt_now().day)))
                 .scalar(),
             },
             "logs": [
@@ -1602,7 +1651,7 @@ def history_detail(record_id: int):
     r = DetectionRecord.query.get_or_404(record_id)
     if (not current_user.is_admin) and r.user_id != current_user.id:
         return jsonify({"ok": False, "message": "forbidden"}), 403
-    return jsonify({"ok": True, "record": {"id": r.id, "time": r.detect_time.strftime("%Y-%m-%d %H:%M:%S"), "category": r.category, "count": r.count, "confidence": r.confidence, "operator": r.operator_name, "operation_type": r.operation_type, "note": r.note}})
+    return jsonify({"ok": True, "record": {"id": r.id, "time": to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M:%S"), "category": r.category, "count": r.count, "confidence": r.confidence, "operator": r.operator_name, "operation_type": r.operation_type, "note": r.note}})
 
 
 @app.get("/api/openmv/frame")

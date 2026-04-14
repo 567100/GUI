@@ -525,16 +525,33 @@ def init_db():
         if not db.session.get(SystemConfig, "openmv_settings"):
             set_config_json("openmv_settings", openmv_settings)
 
-        admin = User.query.filter_by(username="admin").first()
-        if not admin:
-            admin = User(
-                username="admin",
+        primary_admin = User.query.filter_by(username="rtxq").first()
+        legacy_admin = User.query.filter_by(username="admin").first()
+
+        if not primary_admin and legacy_admin:
+            legacy_admin.username = "rtxq"
+            legacy_admin.is_admin = True
+            db.session.commit()
+            primary_admin = legacy_admin
+            legacy_admin = None
+            add_log("system", "已将历史管理员账号 admin 迁移为 rtxq")
+
+        if not primary_admin:
+            primary_admin = User(
+                username="rtxq",
                 password_hash=hash_password("admin123456"),
                 is_admin=True,
             )
-            db.session.add(admin)
+            db.session.add(primary_admin)
             db.session.commit()
-            add_log("system", "初始化默认管理员账号：admin/admin123456")
+            add_log("system", "初始化主管理员账号：rtxq/admin123456")
+
+        if legacy_admin and legacy_admin.id != primary_admin.id:
+            DetectionRecord.query.filter_by(user_id=legacy_admin.id).delete(synchronize_session=False)
+            SystemLog.query.filter_by(user_id=legacy_admin.id).delete(synchronize_session=False)
+            db.session.delete(legacy_admin)
+            db.session.commit()
+            add_log("system", "已删除多余的 legacy 管理员账号：admin")
 
 
 def get_lan_ip() -> str:
@@ -1221,7 +1238,7 @@ def live_stats():
                 "active_users": User.query.filter(
                     User.is_active_account.is_(True),
                     User.last_login_at.isnot(None),
-                    User.last_login_at >= now - timedelta(minutes=5),
+                    User.last_login_at >= today_start,
                 ).count(),
                 "camera_type": runtime_state["camera_type"],
                 "resolution": openmv_settings["resolution"],

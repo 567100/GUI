@@ -320,6 +320,7 @@ def clear_bound_session(user: User | None) -> None:
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
     session.pop("remember_login", None)
+    session.pop("password_verified", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -524,16 +525,33 @@ def init_db():
         if not db.session.get(SystemConfig, "openmv_settings"):
             set_config_json("openmv_settings", openmv_settings)
 
-        admin = User.query.filter_by(username="admin").first()
-        if not admin:
-            admin = User(
-                username="admin",
+        primary_admin = User.query.filter_by(username="rtxq").first()
+        legacy_admin = User.query.filter_by(username="admin").first()
+
+        if not primary_admin and legacy_admin:
+            legacy_admin.username = "rtxq"
+            legacy_admin.is_admin = True
+            db.session.commit()
+            primary_admin = legacy_admin
+            legacy_admin = None
+            add_log("system", "已将历史管理员账号 admin 迁移为 rtxq")
+
+        if not primary_admin:
+            primary_admin = User(
+                username="rtxq",
                 password_hash=hash_password("admin123456"),
                 is_admin=True,
             )
-            db.session.add(admin)
+            db.session.add(primary_admin)
             db.session.commit()
-            add_log("system", "初始化默认管理员账号：admin/admin123456")
+            add_log("system", "初始化主管理员账号：rtxq/admin123456")
+
+        if legacy_admin and legacy_admin.id != primary_admin.id:
+            DetectionRecord.query.filter_by(user_id=legacy_admin.id).delete(synchronize_session=False)
+            SystemLog.query.filter_by(user_id=legacy_admin.id).delete(synchronize_session=False)
+            db.session.delete(legacy_admin)
+            db.session.commit()
+            add_log("system", "已删除多余的 legacy 管理员账号：admin")
 
 
 def get_lan_ip() -> str:
@@ -577,6 +595,20 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
+        if session.get("password_verified") is not True:
+            clear_bound_session(current_user)
+            logout_user()
+            if request.path.startswith("/api/"):
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "AUTH_RELOGIN_REQUIRED",
+                        "message": "请先在登录页面输入账号密码完成验证",
+                        "redirect": url_for("login"),
+                    }
+                ), 401
+            flash("请先在登录页面输入账号密码完成验证", "warning")
+            return redirect(url_for("login"))
 
         opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
         if opted_in_auto_login:
@@ -640,8 +672,6 @@ def shutdown_session_appcontext(exception=None):
 
 @app.route("/")
 def index():
-    if current_user.is_authenticated:
-        return redirect(url_for("monitor"))
     return redirect(url_for("login"))
 
 
@@ -650,7 +680,6 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        remember = request.form.get("remember") == "on"
 
         try:
             user = User.query.filter_by(username=username).first()
@@ -676,20 +705,16 @@ def login():
 
                         return render_template("login.html")
 
-                login_user(user, remember=remember)
-                session["remember_login"] = remember
+                login_user(user, remember=False)
+                session["remember_login"] = False
+                session["password_verified"] = True
                 bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()
                 add_log("auth", f"用户登录: {username}", user.id)
                 response = make_response(redirect(url_for("monitor")))
-                if remember:
-                    max_age = int(app.config["REMEMBER_COOKIE_DURATION"].total_seconds())
-                    response.set_cookie(AUTO_LOGIN_COOKIE, "1", max_age=max_age, httponly=True, samesite="Lax")
-                else:
-                    response.delete_cookie(AUTO_LOGIN_COOKIE)
-
-                    response.delete_cookie(REMEMBER_COOKIE_NAME)
+                response.delete_cookie(AUTO_LOGIN_COOKIE)
+                response.delete_cookie(REMEMBER_COOKIE_NAME)
 
                 return response
 
@@ -1213,7 +1238,7 @@ def live_stats():
                 "active_users": User.query.filter(
                     User.is_active_account.is_(True),
                     User.last_login_at.isnot(None),
-                    User.last_login_at >= now - timedelta(minutes=5),
+                    User.last_login_at >= today_start,
                 ).count(),
                 "camera_type": runtime_state["camera_type"],
                 "resolution": openmv_settings["resolution"],
@@ -1624,7 +1649,7 @@ def account_me():
                 "phone": current_user.phone,
                 "avatar_url": current_user.avatar_url,
                 "is_admin": current_user.is_admin,
-                "created_at": current_user.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": safe_fmt_dt(current_user.created_at),
             },
         }
     )

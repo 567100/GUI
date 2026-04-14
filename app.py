@@ -320,6 +320,7 @@ def clear_bound_session(user: User | None) -> None:
     session.pop("auth_session_token", None)
     session.pop("heartbeat_at", None)
     session.pop("remember_login", None)
+    session.pop("password_verified", None)
 
 
 def clear_runtime_after_logout() -> None:
@@ -577,6 +578,20 @@ def parse_time_range(range_key: str, start_time: str, end_time: str):
 @app.before_request
 def make_session_permanent():
     if current_user.is_authenticated:
+        if session.get("password_verified") is not True:
+            clear_bound_session(current_user)
+            logout_user()
+            if request.path.startswith("/api/"):
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "AUTH_RELOGIN_REQUIRED",
+                        "message": "请先在登录页面输入账号密码完成验证",
+                        "redirect": url_for("login"),
+                    }
+                ), 401
+            flash("请先在登录页面输入账号密码完成验证", "warning")
+            return redirect(url_for("login"))
 
         opted_in_auto_login = session.get("remember_login") is True or request.cookies.get(AUTO_LOGIN_COOKIE) == "1"
         if opted_in_auto_login:
@@ -640,8 +655,6 @@ def shutdown_session_appcontext(exception=None):
 
 @app.route("/")
 def index():
-    if current_user.is_authenticated:
-        return redirect(url_for("monitor"))
     return redirect(url_for("login"))
 
 
@@ -650,7 +663,6 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        remember = request.form.get("remember") == "on"
 
         try:
             user = User.query.filter_by(username=username).first()
@@ -676,20 +688,16 @@ def login():
 
                         return render_template("login.html")
 
-                login_user(user, remember=remember)
-                session["remember_login"] = remember
+                login_user(user, remember=False)
+                session["remember_login"] = False
+                session["password_verified"] = True
                 bind_user_session(user)
                 user.last_login_at = datetime.utcnow()
                 db.session.commit()
                 add_log("auth", f"用户登录: {username}", user.id)
                 response = make_response(redirect(url_for("monitor")))
-                if remember:
-                    max_age = int(app.config["REMEMBER_COOKIE_DURATION"].total_seconds())
-                    response.set_cookie(AUTO_LOGIN_COOKIE, "1", max_age=max_age, httponly=True, samesite="Lax")
-                else:
-                    response.delete_cookie(AUTO_LOGIN_COOKIE)
-
-                    response.delete_cookie(REMEMBER_COOKIE_NAME)
+                response.delete_cookie(AUTO_LOGIN_COOKIE)
+                response.delete_cookie(REMEMBER_COOKIE_NAME)
 
                 return response
 
@@ -1624,7 +1632,7 @@ def account_me():
                 "phone": current_user.phone,
                 "avatar_url": current_user.avatar_url,
                 "is_admin": current_user.is_admin,
-                "created_at": current_user.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": safe_fmt_dt(current_user.created_at),
             },
         }
     )

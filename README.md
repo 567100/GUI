@@ -81,7 +81,7 @@ SQLite 文件：`instance/yolo_monitor.db`
 
 重启电脑后数据仍保留。
 
-## 7. 主要 API（用于前后端对接）
+## 7. 前后端对接
 - `POST /api/camera/start` 开启摄像头状态
 - `POST /api/camera/stop` 关闭摄像头状态
 - `POST /api/detection/start` 开始检测状态

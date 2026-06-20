@@ -1,0 +1,33 @@
+# PythonAnywhere deployment dependencies
+# Recommended runtime: Python 3.10
+#
+# Install with:
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements_pythonanywhere.txt
+#
+# The web charts are rendered by ECharts in the browser, so this file does not
+# explicitly include pandas, seaborn or tensorboard.
+#
+# Important: the current backend loads the OpenVINO model through
+# `ultralytics.YOLO`. Ultralytics may install PyTorch, torchvision, matplotlib
+# and other transitive dependencies even though this project does not import
+# those packages directly. Do not remove Ultralytics until app.py is converted
+# to use the OpenVINO Runtime API directly.
+
+# Flask application and database
+Flask>=3.0,<3.1
+Flask-Login>=0.6.3,<0.7
+Flask-SQLAlchemy>=3.1,<3.2
+Werkzeug>=3.0,<3.1
+
+# Image processing and inference
+numpy>=1.23.5,<1.27
+Pillow>=9.0,<11
+opencv-python-headless>=4.8,<4.11
+openvino>=2024.6,<2027
+ultralytics>=8.2,<9
+
+# Model metadata and HTTP utilities used by the inference stack
+PyYAML>=6.0,<7
+requests>=2.31,<3
+

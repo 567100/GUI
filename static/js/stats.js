@@ -1,7 +1,12 @@
 const lineChart = echarts.init(document.getElementById('lineChart'));
 const pieChart = echarts.init(document.getElementById('pieChart'));
-const barChart = echarts.init(document.getElementById('barChart'));
+const confidenceChart = echarts.init(document.getElementById('confidenceChart'));
 let allCategories = [];
+const categoryDisplayNames = { Fissure: '条状缺陷', Crater: '坑状缺陷' };
+
+function displayCategory(name) {
+  return categoryDisplayNames[name] || name;
+}
 
 async function refreshCameraStatusCard() {
   const el = document.getElementById('cardCamera');
@@ -85,24 +90,97 @@ function applyPie(pie = []) {
   });
 }
 
-function applyBars(bar = []) {
-  if (!bar.length) {
-    togglePlaceholder('barPlaceholder', true, 'barChart');
+function applyConfidenceTrend(trend = {}) {
+  const times = trend.times || [];
+  const sourceSeries = trend.series || [];
+  if (!times.length || !sourceSeries.length) {
+    togglePlaceholder('confidencePlaceholder', true, 'confidenceChart');
     return;
   }
-  togglePlaceholder('barPlaceholder', false, 'barChart');
-  const sorted = [...bar].sort((a, b) => b.value - a.value);
-  barChart.setOption({
-    tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: sorted.map((x) => x.name) },
-    yAxis: { type: 'value' },
-    series: [{
-      type: 'bar',
-      data: sorted.map((x) => x.value),
-      label: { show: true, position: 'top' },
-      itemStyle: { color: '#36a2eb', borderRadius: [8, 8, 0, 0] },
-    }],
+  togglePlaceholder('confidencePlaceholder', false, 'confidenceChart');
+  const colors = ['#4f46e5', '#06b6d4', '#f59e0b', '#ef4444', '#10b981'];
+  const series = [];
+  sourceSeries.forEach((item, index) => {
+    const name = displayCategory(item.name);
+    const color = colors[index % colors.length];
+    series.push({
+      name,
+      type: 'line',
+      smooth: 0.35,
+      connectNulls: true,
+      showSymbol: false,
+      symbol: 'circle',
+      data: item.data,
+      lineStyle: { width: 3, color },
+      itemStyle: { color },
+      emphasis: { focus: 'series', lineStyle: { width: 5 } },
+      endLabel: {
+        show: true,
+        formatter: (params) => `${name} ${params.value ?? '-'}%`,
+        color,
+        fontWeight: 600,
+      },
+      areaStyle: {
+        opacity: 0.08,
+        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+          { offset: 0, color },
+          { offset: 1, color: 'rgba(255,255,255,0)' },
+        ]),
+      },
+      animationDuration: 900,
+      animationDurationUpdate: 600,
+    });
+    const lastIndex = item.data.reduce((found, value, dataIndex) => (value == null ? found : dataIndex), -1);
+    if (lastIndex >= 0) {
+      series.push({
+        name: `${name} 当前值`,
+        type: 'effectScatter',
+        data: [[times[lastIndex], item.data[lastIndex]]],
+        symbolSize: 10,
+        rippleEffect: { scale: 3, brushType: 'stroke' },
+        itemStyle: { color },
+        tooltip: { show: false },
+        silent: true,
+      });
+    }
   });
+  confidenceChart.setOption({
+    color: colors,
+    animation: true,
+    tooltip: {
+      trigger: 'axis',
+      valueFormatter: (value) => value == null ? '-' : `${value}%`,
+    },
+    legend: {
+      top: 0,
+      data: sourceSeries.map((item) => displayCategory(item.name)),
+    },
+    grid: { left: 52, right: 115, top: 48, bottom: 68 },
+    toolbox: {
+      right: 12,
+      feature: {
+        dataZoom: { yAxisIndex: 'none' },
+        restore: {},
+        saveAsImage: {},
+      },
+    },
+    dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 16 }],
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: times,
+      axisLabel: { hideOverlap: true },
+    },
+    yAxis: {
+      type: 'value',
+      min: 0,
+      max: 100,
+      name: '平均置信度',
+      axisLabel: { formatter: '{value}%' },
+      splitLine: { lineStyle: { type: 'dashed', color: '#e2e8f0' } },
+    },
+    series,
+  }, true);
 }
 
 async function refreshCards() {
@@ -131,7 +209,7 @@ async function refreshAdvanced() {
 
   applyLine(data.timeline || []);
   applyPie(data.pie || []);
-  applyBars(data.bar || []);
+  applyConfidenceTrend(data.confidence_trend || {});
 }
 
 document.getElementById('refreshBtn').onclick = async () => {
@@ -170,7 +248,7 @@ async function init() {
   setTimeout(() => {
     lineChart.resize();
     pieChart.resize();
-    barChart.resize();
+    confidenceChart.resize();
   }, 200);
 }
 
@@ -178,5 +256,5 @@ init();
 window.addEventListener('resize', () => {
   lineChart.resize();
   pieChart.resize();
-  barChart.resize();
+  confidenceChart.resize();
 });

@@ -30,7 +30,7 @@
 <div class="card p-3">
   <div class="table-responsive history-table-scroll">
   <table class="table table-striped align-middle" id="historyTable">
-    <thead><tr><th>ID</th><th>检测时间</th><th>目标类别</th><th>数量</th><th>操作人</th><th>操作类型</th><th>操作</th></tr></thead>
+    <thead><tr><th>ID</th><th>检测时间</th><th>目标类别</th><th>数量</th><th>图像</th><th>操作人</th><th>操作类型</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
@@ -44,10 +44,27 @@
 </div>
 
 <div class="modal fade" id="detailModal" tabindex="-1">
-  <div class="modal-dialog modal-lg modal-dialog-slide">
+  <div class="modal-dialog modal-xl modal-dialog-slide">
     <div class="modal-content">
       <div class="modal-header"><h5 class="modal-title">记录详情</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
       <div class="modal-body" id="detailBody">加载中...</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="historyImageModal" tabindex="-1">
+  <div class="modal-dialog modal-fullscreen modal-dialog-centered">
+    <div class="modal-content history-image-modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">检测图像放大查看</h5>
+        <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body d-flex align-items-center justify-content-center">
+        <div class="history-image-zoom-stage" id="historyImageZoomStage">
+          <img id="historyZoomImage" alt="放大的检测图像">
+          <canvas id="historyZoomCanvas"></canvas>
+        </div>
+      </div>
     </div>
   </div>
 </div>

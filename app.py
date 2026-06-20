@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import secrets
 
 import time
@@ -16,6 +15,11 @@ from pathlib import Path
 import numpy as np
 from werkzeug.security import check_password_hash, generate_password_hash
 
+os.environ.setdefault(
+    "YOLO_CONFIG_DIR",
+    str(Path(__file__).resolve().parent / ".runtime" / "ultralytics"),
+)
+
 from flask import (
     Flask,
     Response,
@@ -25,6 +29,7 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_from_directory,
     session,
     url_for,
     has_request_context,
@@ -43,11 +48,9 @@ from sqlalchemy.orm import Session
 
 try:
     import serial
-except ImportError:  # pragma: no cover
-    serial = None
-try:
     from serial.tools import list_ports
 except ImportError:  # pragma: no cover
+    serial = None
     list_ports = None
 
 try:
@@ -66,6 +69,7 @@ except ImportError:  # pragma: no cover
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "instance" / "yolo_monitor.db"
+DETECTION_IMAGE_DIR = BASE_DIR / "instance" / "detection_images"
 
 
 def resolve_database_uri() -> str:
@@ -85,6 +89,27 @@ AUTO_LOGIN_COOKIE = "auto_login_opt_in"
 REMEMBER_COOKIE_NAME = os.getenv("REMEMBER_COOKIE_NAME", "remember_token")
 ACTIVE_SESSION_TIMEOUT_SECONDS = int(os.getenv("ACTIVE_SESSION_TIMEOUT_SECONDS", "5"))
 ACTIVE_SESSION_HEARTBEAT_SECONDS = int(os.getenv("ACTIVE_SESSION_HEARTBEAT_SECONDS", "2"))
+DETECTION_RECORD_INTERVAL_SECONDS = float(os.getenv("DETECTION_RECORD_INTERVAL_SECONDS", "5.0"))
+DETECTION_IMAGE_JPEG_QUALITY = min(
+    max(int(os.getenv("DETECTION_IMAGE_JPEG_QUALITY", "40")), 20),
+    95,
+)
+DETECTION_IMAGE_MAX_SIZE = max(
+    int(os.getenv("DETECTION_IMAGE_MAX_SIZE", "320")),
+    160,
+)
+DETECTION_IMAGE_MIN_CONFIDENCE = min(
+    max(float(os.getenv("DETECTION_IMAGE_MIN_CONFIDENCE", "0.65")), 0.0),
+    1.0,
+)
+MAX_IMAGE_UPLOAD_BYTES = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+INTELLIGENCE_API_KEY = (
+    os.getenv("INTELLIGENCE_API_KEY", "").strip()
+    or os.getenv("DEEPSEEK_API_KEY", "").strip()
+)
+INTELLIGENCE_API_BASE = os.getenv("INTELLIGENCE_API_BASE", "https://api.deepseek.com").rstrip("/")
+INTELLIGENCE_MODEL = os.getenv("INTELLIGENCE_MODEL", "deepseek-v4-flash").strip()
+INTELLIGENCE_TIMEOUT_SECONDS = float(os.getenv("INTELLIGENCE_TIMEOUT_SECONDS", "25"))
 
 
 app = Flask(__name__)
@@ -106,6 +131,7 @@ app.config.update(
     REMEMBER_COOKIE_DURATION=timedelta(days=180),
     REMEMBER_COOKIE_HTTPONLY=True,
     REMEMBER_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=MAX_IMAGE_UPLOAD_BYTES,
 )
 app.permanent_session_lifetime = timedelta(days=180)
 
@@ -140,6 +166,10 @@ class DetectionRecord(db.Model):
     operator_name = db.Column(db.String(50), nullable=False, default="system")
     operation_type = db.Column(db.String(50), nullable=False, default="自动检测")
     note = db.Column(db.String(255), nullable=False, default="")
+    image_path = db.Column(db.String(255), nullable=False, default="")
+    boxes_json = db.Column(db.Text, nullable=False, default="[]")
+    frame_width = db.Column(db.Integer, nullable=False, default=0)
+    frame_height = db.Column(db.Integer, nullable=False, default=0)
 
 
 class SystemLog(db.Model):
@@ -173,9 +203,10 @@ def load_user(user_id: str):
 class YoloModelService:
     """
     模型说明：
-    1) 默认加载仓库根目录 `best.onnx`。
+    1) 优先加载 `models/best_openvino_model`，不存在时回退到 `models/best.pt`。
     2) 支持环境变量 YOLO_MODEL_PATH 指定权重路径。
-    3) 保持返回格式不变，前端与数据库将自动复用。
+    3) OpenVINO 模型在启动时预热，避免第一次点击检测时长时间等待。
+    4) 保持返回格式不变，前端与数据库将自动复用。
 
     返回格式:
     {
@@ -188,16 +219,43 @@ class YoloModelService:
 
     def __init__(self):
         custom_path = os.getenv("YOLO_MODEL_PATH", "").strip()
-        self.model_path = Path(custom_path) if custom_path else (BASE_DIR / "best.onnx")
+        custom_model_path = Path(custom_path) if custom_path else None
+        if custom_model_path and not custom_model_path.is_absolute():
+            custom_model_path = BASE_DIR / custom_model_path
+        self.model_path = custom_model_path or self._default_model_path()
         self.model = None
         self.model_name = self.model_path.name
+        self.backend = self._detect_backend(self.model_path)
+        self.imgsz = int(os.getenv("YOLO_IMGSZ", "640"))
+        self.conf = float(os.getenv("YOLO_CONF", "0.25"))
+        self.iou = float(os.getenv("YOLO_IOU", "0.45"))
+        self.warmup_ms = 0.0
         self.last_error = ""
         self.last_reload_attempt_ts = 0.0
         self.reload()
 
+    @staticmethod
+    def _default_model_path() -> Path:
+        candidates = (
+            BASE_DIR / "models" / "best_openvino_model",
+            BASE_DIR / "models" / "best_int8_openvino_model",
+            BASE_DIR / "models" / "best.pt",
+        )
+        return next((path for path in candidates if path.exists()), candidates[0])
+
+    @staticmethod
+    def _detect_backend(path: Path) -> str:
+        if path.is_dir() or path.suffix.lower() == ".xml":
+            return "OpenVINO IR"
+        if path.suffix.lower() == ".pt":
+            return "PyTorch"
+        return path.suffix.lstrip(".").upper() or "未知"
+
     def reload(self) -> tuple[bool, str]:
         self.model = None
         self.model_name = self.model_path.name
+        self.backend = self._detect_backend(self.model_path)
+        self.warmup_ms = 0.0
         self.last_error = ""
         self.last_reload_attempt_ts = time.time()
         if not YOLO:
@@ -207,10 +265,21 @@ class YoloModelService:
             self.last_error = f"模型文件不存在：{self.model_path.name}"
             return False, self.last_error
         try:
-            self.model = YOLO(str(self.model_path))
-            return True, f"模型已加载：{self.model_path.name}"
+            self.model = YOLO(str(self.model_path), task="detect")
+            if self.backend == "OpenVINO IR" and os.getenv("YOLO_WARMUP", "1") != "0":
+                warmup_start = time.perf_counter()
+                self.model.predict(
+                    source=np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8),
+                    imgsz=self.imgsz,
+                    conf=self.conf,
+                    iou=self.iou,
+                    verbose=False,
+                )
+                self.warmup_ms = round((time.perf_counter() - warmup_start) * 1000, 2)
+            return True, f"模型已加载：{self.model_path.name}（{self.backend}）"
         except Exception as exc:
             self.last_error = f"模型加载失败：{exc}"
+            self.model = None
             return False, self.last_error
 
     def ensure_loaded(self, cooldown_sec: float = 5.0) -> bool:
@@ -227,7 +296,13 @@ class YoloModelService:
             source = frame_meta.get("frame_array") if frame_meta else None
             if source is None:
                 return {"boxes": [], "counts": {}, "warning": "未收到可用视频帧，无法进行推理"}
-            result = self.model.predict(source=source, verbose=False)[0]
+            result = self.model.predict(
+                source=source,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                iou=self.iou,
+                verbose=False,
+            )[0]
             boxes = []
             counts = Counter()
             for b in result.boxes:
@@ -237,44 +312,426 @@ class YoloModelService:
                 x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
                 boxes.append({"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "label": label, "conf": conf})
                 counts[label] += 1
-            return {"boxes": boxes, "counts": dict(counts)}
+            height, width = source.shape[:2]
+            return {
+                "boxes": boxes,
+                "counts": dict(counts),
+                "frame_width": int(width),
+                "frame_height": int(height),
+                "backend": self.backend,
+            }
         return {"boxes": [], "counts": {}, "warning": self.last_error or "模型未加载，无法推理"}
 
 
 model_service = YoloModelService()
+
+DEFECT_KNOWLEDGE = {
+    "Crater": {
+        "name": "坑状缺陷",
+        "explanation": "表面出现局部凹坑、孔洞或冲击状损伤，可能与材料剥落、腐蚀、碰撞或成型不良有关。",
+        "solutions": {
+            "low": [
+                "当前识别可信度较低，暂不直接判定为坑状缺陷。",
+                "清洁表面污渍和反光区域，调整光照与拍摄角度后重新检测。",
+                "若复拍后置信度仍低且现场肉眼无明显凹陷，可列入常规观察记录。",
+            ],
+            "medium": [
+                "将该区域标记为疑似坑状缺陷，并安排一次近距离人工复核。",
+                "使用直尺、深度尺或侧光观察确认凹坑边界和大致深度。",
+                "复核前不建议直接维修；确认后再决定清理、填补或继续观察。",
+            ],
+            "high": [
+                "该区域较大概率为坑状缺陷，应纳入近期处置清单。",
+                "测量直径、深度和边缘剥落范围，并检查周边是否存在腐蚀扩展。",
+                "浅表缺陷可清理、打磨、填补并恢复防护层；较深缺陷应进行补强评估。",
+            ],
+            "critical": [
+                "该区域高度疑似坑状缺陷，建议优先隔离标记并尽快人工确认。",
+                "立即测量深度、剩余厚度及周边材料完整性，必要时采用无损检测。",
+                "若位于受力部位、持续剥落或深度超限，应暂停相关区域使用并评估补强或更换。",
+            ],
+        },
+    },
+    "Fissure": {
+        "name": "条状缺陷",
+        "explanation": "表面出现细长裂纹或条带状异常，可能与疲劳、应力集中、材料开裂或施工接缝异常有关。",
+        "solutions": {
+            "low": [
+                "当前识别可信度较低，可能受到划痕、阴影、接缝或纹理干扰。",
+                "擦拭表面并采用垂直光和侧光分别复拍，确认条带是否真实存在。",
+                "若多角度复拍均未重复出现，可作为误检记录，不立即采取维修措施。",
+            ],
+            "medium": [
+                "将该区域列为疑似条状缺陷，沿走向两端扩大拍摄范围。",
+                "使用放大观察或着色标记确认长度、宽度及端部是否继续延伸。",
+                "在人工确认前保持重点观察，避免在该区域进行冲击或额外加载。",
+            ],
+            "high": [
+                "该区域较大概率为条状缺陷，应尽快进行人工复核和长度测量。",
+                "建议采用渗透检测、放大检查或其他适用的无损检测方法确认裂纹性质。",
+                "若确认是表面裂纹，应进行止裂、修补或专项维修，并建立复查周期。",
+            ],
+            "critical": [
+                "该区域高度疑似条状裂纹，存在继续扩展的可能，应优先处置。",
+                "立即标记裂纹两端，检查是否位于焊缝、连接处或主要受力区域。",
+                "受力区域应限制使用并组织专项检测；确认扩展或贯穿时，应制定补强、更换或停用方案。",
+            ],
+        },
+    },
+}
+
+CONFIDENCE_BANDS = (
+    (0.40, "low", "低可信提示", "待复核"),
+    (0.65, "medium", "疑似缺陷", "低"),
+    (0.85, "high", "较高可信", "中"),
+    (1.01, "critical", "高可信缺陷", "高"),
+)
+
+
+def confidence_profile(confidence: float) -> tuple[str, str, str, str]:
+    lower_bound = 0.0
+    for upper_bound, key, title, risk_level in CONFIDENCE_BANDS:
+        if confidence < upper_bound:
+            display_upper = min(upper_bound, 1.0)
+            interval = f"{lower_bound * 100:.0f}%–{display_upper * 100:.0f}%"
+            return key, title, risk_level, interval
+        lower_bound = upper_bound
+    return "critical", "高可信缺陷", "高", "85%–100%"
+
+
+def decode_image_bytes(raw: bytes):
+    if not raw:
+        return None
+    if cv2 is not None:
+        frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            return frame
+    if Image is not None:
+        try:
+            from io import BytesIO
+
+            rgb = np.array(Image.open(BytesIO(raw)).convert("RGB"))
+            if rgb.size > 0:
+                return rgb[:, :, ::-1].copy()
+        except Exception:
+            return None
+    return None
+
+
+def extract_jpeg_frame(buffer: bytearray) -> bytes:
+    start = buffer.find(b"\xff\xd8")
+    if start < 0:
+        if len(buffer) > 4 * 1024 * 1024:
+            del buffer[:-2048]
+        return b""
+    end = buffer.find(b"\xff\xd9", start + 2)
+    if end < 0:
+        if start > 0:
+            del buffer[:start]
+        return b""
+    frame = bytes(buffer[start : end + 2])
+    del buffer[: end + 2]
+    return frame
+
+
+def extract_serial_text_messages(buffer: bytearray) -> list[str]:
+    jpeg_start = buffer.find(b"\xff\xd8")
+    text_end = jpeg_start if jpeg_start >= 0 else len(buffer)
+    if text_end <= 0:
+        return []
+    prefix = bytes(buffer[:text_end])
+    consume_to = max(prefix.rfind(b"\n"), prefix.rfind(b"\r"))
+    if consume_to < 0:
+        return []
+    raw = bytes(buffer[: consume_to + 1])
+    del buffer[: consume_to + 1]
+    text = raw.decode("utf-8", errors="ignore")
+    return [line.strip()[:500] for line in text.replace("\r", "\n").split("\n") if line.strip()]
+
+
+def close_machine_serial() -> None:
+    global machine_serial_conn, machine_serial_buffer
+    if machine_serial_conn:
+        try:
+            machine_serial_conn.close()
+        except Exception:
+            pass
+    machine_serial_conn = None
+    machine_serial_buffer = bytearray()
+    runtime_state["machine_connected"] = False
+
+
+def save_detection_snapshot(frame: np.ndarray | None) -> str:
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return ""
+    height, width = frame.shape[:2]
+    longest_side = max(width, height)
+    if longest_side > DETECTION_IMAGE_MAX_SIZE:
+        scale = DETECTION_IMAGE_MAX_SIZE / longest_side
+        thumbnail_size = (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        )
+        if cv2 is not None:
+            frame = cv2.resize(frame, thumbnail_size, interpolation=cv2.INTER_AREA)
+        elif Image is not None:
+            rgb_image = Image.fromarray(frame[:, :, ::-1])
+            rgb_image.thumbnail(
+                (DETECTION_IMAGE_MAX_SIZE, DETECTION_IMAGE_MAX_SIZE),
+                Image.Resampling.LANCZOS,
+            )
+            frame = np.asarray(rgb_image)[:, :, ::-1]
+
+    DETECTION_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}_{secrets.token_hex(4)}.jpg"
+    target = DETECTION_IMAGE_DIR / filename
+    if cv2 is not None and cv2.imwrite(
+        str(target),
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), DETECTION_IMAGE_JPEG_QUALITY],
+    ):
+        return filename
+    if Image is not None:
+        try:
+            Image.fromarray(frame[:, :, ::-1]).save(
+                target,
+                format="JPEG",
+                quality=DETECTION_IMAGE_JPEG_QUALITY,
+            )
+            return filename
+        except Exception:
+            pass
+    return ""
+
+
+def record_detection_result(
+    result: dict,
+    operation_type: str,
+    note: str = "",
+    frame: np.ndarray | None = None,
+) -> None:
+    boxes_json = json.dumps(result.get("boxes", []), ensure_ascii=False)
+    frame_width = int(result.get("frame_width") or (frame.shape[1] if frame is not None else 0))
+    frame_height = int(result.get("frame_height") or (frame.shape[0] if frame is not None else 0))
+    category_confidences = {}
+    for category, count in result.get("counts", {}).items():
+        confidences = [
+            float(box["conf"])
+            for box in result.get("boxes", [])
+            if box.get("label") == category
+        ]
+        category_confidences[category] = (
+            sum(confidences) / len(confidences)
+            if confidences
+            else 0.0
+        )
+
+    should_save_image = any(
+        confidence >= DETECTION_IMAGE_MIN_CONFIDENCE
+        for confidence in category_confidences.values()
+    )
+    image_path = save_detection_snapshot(frame) if should_save_image else ""
+
+    for category, count in result.get("counts", {}).items():
+        if count <= 0:
+            continue
+        avg_conf = category_confidences.get(category, 0.0)
+        category_image_path = (
+            image_path
+            if avg_conf >= DETECTION_IMAGE_MIN_CONFIDENCE
+            else ""
+        )
+        db.session.add(
+            DetectionRecord(
+                user_id=current_user.id,
+                category=category,
+                count=count,
+                confidence=round(avg_conf, 2),
+                operator_name=current_user.username,
+                operation_type=operation_type,
+                note=note[:255],
+                image_path=category_image_path,
+                boxes_json=boxes_json,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+        )
+    db.session.commit()
+
+
+def delete_detection_image_if_unused(record: DetectionRecord) -> None:
+    image_path = (record.image_path or "").strip()
+    if not image_path:
+        return
+    remaining = DetectionRecord.query.filter(
+        DetectionRecord.image_path == image_path,
+        DetectionRecord.id != record.id,
+    ).first()
+    if remaining:
+        return
+    target = DETECTION_IMAGE_DIR / Path(image_path).name
+    if target.exists() and target.is_file():
+        try:
+            target.unlink()
+        except OSError:
+            app.logger.warning("无法删除检测图片: %s", target)
+
+
+def build_rule_assessment(boxes: list[dict], frame_width: int, frame_height: int) -> dict:
+    frame_area = max(frame_width * frame_height, 1)
+    findings = []
+    highest_level = "待复核"
+    level_rank = {"待复核": 0, "低": 1, "中": 2, "高": 3}
+
+    for index, box in enumerate(boxes, start=1):
+        label = str(box.get("label", ""))
+        knowledge = DEFECT_KNOWLEDGE.get(
+            label,
+            {
+                "name": label or "未知缺陷",
+                "explanation": "检测到异常区域，需要结合现场情况进行人工复核。",
+                "solutions": {
+                    key: ["记录位置与尺寸。", "安排人工复核。", "根据复核结果制定处置方案。"]
+                    for key in ("low", "medium", "high", "critical")
+                },
+            },
+        )
+        area_ratio = max(float(box.get("w", 0)) * float(box.get("h", 0)) / frame_area, 0.0)
+        confidence = float(box.get("conf", 0))
+        profile_key, confidence_title, level, confidence_interval = confidence_profile(confidence)
+        area_escalated = False
+        if area_ratio >= 0.12 and level in {"待复核", "低", "中"}:
+            next_level = {"待复核": "低", "低": "中", "中": "高"}
+            level = next_level[level]
+            area_escalated = True
+        if level_rank[level] > level_rank[highest_level]:
+            highest_level = level
+        center_x = float(box.get("x", 0)) + float(box.get("w", 0)) / 2
+        center_y = float(box.get("y", 0)) + float(box.get("h", 0)) / 2
+        horizontal = "左侧" if center_x < frame_width / 3 else ("右侧" if center_x > frame_width * 2 / 3 else "中部")
+        vertical = "上部" if center_y < frame_height / 3 else ("下部" if center_y > frame_height * 2 / 3 else "中部")
+        findings.append(
+            {
+                "index": index,
+                "label": label,
+                "name": knowledge["name"],
+                "confidence": round(confidence, 3),
+                "area_ratio": round(area_ratio, 4),
+                "position": f"{vertical}{horizontal}",
+                "risk_level": level,
+                "confidence_band": confidence_title,
+                "confidence_interval": confidence_interval,
+                "area_escalated": area_escalated,
+                "explanation": knowledge["explanation"],
+                "actions": knowledge["solutions"][profile_key],
+            }
+        )
+
+    if not findings:
+        report = "本次图像中未检测到坑状或条状缺陷。建议在光照均匀、画面清晰的条件下复拍，并继续保持周期性巡检。"
+        return {"risk_level": "未发现", "findings": [], "report": report}
+
+    lines = [
+        f"综合风险等级：{highest_level}",
+        "",
+        f"共发现 {len(findings)} 个待研判区域：",
+    ]
+    for item in findings:
+        lines.extend(
+            [
+                "",
+                f"{item['index']}. {item['name']}（置信度 {item['confidence'] * 100:.1f}%）",
+                f"置信分档：{item['confidence_band']}（{item['confidence_interval']}）；位置：{item['position']}。",
+                f"框选面积约占图像 {item['area_ratio'] * 100:.2f}%；风险等级：{item['risk_level']}"
+                + ("（因区域面积较大上调一级）" if item["area_escalated"] else "")
+                + "。",
+                f"研判说明：{item['explanation']}",
+                "分级处置方案：",
+                *[f"- {action}" for action in item["actions"]],
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "提示：自动研判用于辅助筛查，涉及停用、维修或结构安全的决定仍应由现场专业人员复核。",
+        ]
+    )
+    return {"risk_level": highest_level, "findings": findings, "report": "\n".join(lines)}
+
+
+def request_intelligence_assessment(rule_result: dict) -> tuple[str, bool]:
+    if not INTELLIGENCE_API_KEY:
+        return rule_result["report"], False
+
+    prompt = (
+        "你是工业表面缺陷智能研判模型。请根据检测结果，用简洁、专业的中文给出："
+        "1. 缺陷解释；2. 风险等级及依据；3. 建议的复核步骤；4. 分级处置方案。"
+        "必须严格区分不同置信区间，低置信区域以复拍和排除误检为主，中等置信区域以人工确认和测量为主，"
+        "高置信区域以优先检查、维修或限制使用为主。不得虚构图像中未提供的信息，并明确自动研判仅作辅助。\n\n"
+        f"检测结构化数据：{json.dumps(rule_result['findings'], ensure_ascii=False)}"
+    )
+    payload = {
+        "model": INTELLIGENCE_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是本系统的工业缺陷智能研判模块，只输出中文专业研判报告。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 1000,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        f"{INTELLIGENCE_API_BASE}/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {INTELLIGENCE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=INTELLIGENCE_TIMEOUT_SECONDS) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        report = data["choices"][0]["message"]["content"].strip()
+        return report or rule_result["report"], bool(report)
+    except Exception:
+        app.logger.exception("智能研判服务调用失败，已回退到本地规则库")
+        return rule_result["report"], False
+
 
 runtime_state = {
     "camera_on": False,
     "camera_state": "未连接",
     "detection_on": False,
     "last_detection_time": None,
-    "camera_type": "local",
-    "openmv_connected": False,
-    "openmv_mode": "serial",
-    "openmv_target": "",
-    "openmv_last_frame_at": None,
-    "openmv_last_len": 0,
+    "camera_type": "builtin",
+    "camera_label": "未选择",
+    "machine_connected": False,
     "camera_started_at": None,
     "last_inference_ms": 0,
+    "last_recorded_detection_at": 0.0,
 }
 
-openmv_serial_conn = None
-openmv_network_conn = None
-openmv_serial_buffer = bytearray()
-openmv_network_buffer = bytearray()
-
-openmv_settings = {
-    "camera_id": 0,
+camera_settings = {
     "resolution": "720P",
-    "fps": 15,
-    "baudrate": 115200,
+    "fps": 20,
     "flip_horizontal": False,
     "flip_vertical": False,
-    "exposure": 50,
-    "gain": 1.0,
-    "auto_white_balance": True,
-    "serial_timeout": 800,
 }
+
+machine_settings = {
+    "port": "",
+    "baudrate": 115200,
+    "timeout_ms": 300,
+}
+machine_serial_conn = None
+machine_serial_buffer = bytearray()
+machine_last_frame_at = None
+machine_last_rx_bytes = 0
+machine_last_messages = []
 
 
 def bjt_now() -> datetime:
@@ -329,8 +786,9 @@ def clear_runtime_after_logout() -> None:
     runtime_state["camera_on"] = False
     runtime_state["detection_on"] = False
     runtime_state["camera_state"] = "未连接"
-    runtime_state["openmv_connected"] = False
+    runtime_state["camera_label"] = "未选择"
     runtime_state["camera_started_at"] = None
+    close_machine_serial()
 
 
 def is_active_session_stale(user: User) -> bool:
@@ -348,11 +806,9 @@ def safe_fmt_dt(dt: datetime | None) -> str:
 
 
 def is_camera_connected() -> bool:
-    if not runtime_state["camera_on"]:
-        return False
-    if runtime_state["camera_type"] == "openmv":
-        return bool(runtime_state["openmv_connected"])
-    return runtime_state["camera_state"] != "未连接"
+    if runtime_state["camera_type"] == "serial":
+        return bool(runtime_state["camera_on"] and runtime_state["machine_connected"])
+    return bool(runtime_state["camera_on"] and runtime_state["camera_state"] != "未连接")
 
 
 def sync_camera_state() -> bool:
@@ -361,25 +817,6 @@ def sync_camera_state() -> bool:
     if not connected:
         runtime_state["detection_on"] = False
     return connected
-
-
-
-def extract_jpeg_frame(buffer: bytearray) -> bytes:
-    start = buffer.find(b"\xff\xd8")
-    if start == -1:
-        if len(buffer) > 65536:
-            del buffer[:-2048]
-        return b""
-    end = buffer.find(b"\xff\xd9", start + 2)
-    if end == -1:
-        if start > 0:
-            del buffer[:start]
-        return b""
-    frame = bytes(buffer[start : end + 2])
-    del buffer[: end + 2]
-    return frame
-
-
 
 def add_log(log_type: str, content: str, user_id: int | None = None, result: str = "成功"):
     """记录系统日志，且避免日志写入异常影响主流程。"""
@@ -508,6 +945,10 @@ def init_db():
         ensure_column("detection_record", "operator_name", "VARCHAR(50) NOT NULL DEFAULT 'system'")
         ensure_column("detection_record", "operation_type", "VARCHAR(50) NOT NULL DEFAULT '目标检测'")
         ensure_column("detection_record", "note", "VARCHAR(255) NOT NULL DEFAULT ''")
+        ensure_column("detection_record", "image_path", "VARCHAR(255) NOT NULL DEFAULT ''")
+        ensure_column("detection_record", "boxes_json", "TEXT NOT NULL DEFAULT '[]'")
+        ensure_column("detection_record", "frame_width", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column("detection_record", "frame_height", "INTEGER NOT NULL DEFAULT 0")
         ensure_column("system_log", "operator", "VARCHAR(50) NOT NULL DEFAULT 'system'")
         ensure_column("system_log", "ip", "VARCHAR(64) NOT NULL DEFAULT '-'")
         ensure_column("system_log", "result", "VARCHAR(20) NOT NULL DEFAULT '成功'")
@@ -520,10 +961,18 @@ def init_db():
         ensure_column("system_log", "ip", "VARCHAR(64) NOT NULL DEFAULT '-'")
         ensure_column("system_log", "result", "VARCHAR(20) NOT NULL DEFAULT '成功'")
 
-        saved_openmv = get_config_json("openmv_settings", openmv_settings.copy())
-        openmv_settings.update(saved_openmv)
-        if not db.session.get(SystemConfig, "openmv_settings"):
-            set_config_json("openmv_settings", openmv_settings)
+        saved_camera = get_config_json("camera_settings", camera_settings.copy())
+        for key in camera_settings:
+            if key in saved_camera:
+                camera_settings[key] = saved_camera[key]
+        if not db.session.get(SystemConfig, "camera_settings"):
+            set_config_json("camera_settings", camera_settings)
+        saved_machine = get_config_json("machine_settings", machine_settings.copy())
+        for key in machine_settings:
+            if key in saved_machine:
+                machine_settings[key] = saved_machine[key]
+        if not db.session.get(SystemConfig, "machine_settings"):
+            set_config_json("machine_settings", machine_settings)
 
         primary_admin = User.query.filter_by(username="rtxq").first()
         legacy_admin = User.query.filter_by(username="admin").first()
@@ -672,11 +1121,20 @@ def shutdown_session_appcontext(exception=None):
 
 @app.route("/")
 def index():
+    if current_user.is_authenticated:
+        clear_runtime_after_logout()
+        clear_bound_session(current_user)
+        logout_user()
     return redirect(url_for("login"))
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if request.method == "GET" and current_user.is_authenticated:
+        clear_runtime_after_logout()
+        clear_bound_session(current_user)
+        logout_user()
+
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -828,6 +1286,12 @@ def monitor():
     return render_template("monitor.html")
 
 
+@app.route("/image-detection")
+@login_required
+def image_detection_page():
+    return render_template("image_detection.html")
+
+
 @app.route("/stats")
 @login_required
 def stats_page():
@@ -853,21 +1317,8 @@ def admin_page():
 @login_required
 def camera_status():
     connected = sync_camera_state()
-
-    if runtime_state["camera_type"] == "openmv":
-        if runtime_state["openmv_connected"] and runtime_state["camera_on"]:
-            text = "已连接"
-            phase = "running"
-        elif runtime_state["openmv_connected"]:
-            text = "设备已连(待开启)"
-            phase = "ready"
-        else:
-            text = "离线"
-            phase = "offline"
-    else:
-        text = "已连接" if runtime_state["camera_on"] else "离线"
-        phase = "running" if runtime_state["camera_on"] else "offline"
-
+    text = runtime_state["camera_label"] if connected else "离线"
+    phase = "running" if connected else "offline"
 
     return jsonify(
         {
@@ -881,7 +1332,8 @@ def camera_status():
             "camera_on": runtime_state["camera_on"],
             "camera_state": runtime_state["camera_state"],
             "camera_type": runtime_state["camera_type"],
-            "openmv_connected": runtime_state["openmv_connected"],
+            "camera_label": runtime_state["camera_label"],
+            "machine_connected": runtime_state["machine_connected"],
         }
     )
 
@@ -899,10 +1351,12 @@ def system_status():
             "camera_state": camera_state,
             "detection_on": runtime_state["detection_on"],
             "camera_type": runtime_state["camera_type"],
-            "openmv_connected": runtime_state["openmv_connected"],
-            "openmv_mode": runtime_state["openmv_mode"],
-            "openmv_target": runtime_state["openmv_target"],
-            "openmv_settings": openmv_settings,
+            "camera_label": runtime_state["camera_label"],
+            "camera_settings": camera_settings,
+            "machine_connected": runtime_state["machine_connected"],
+            "machine_settings": machine_settings,
+            "machine_last_frame_at": safe_fmt_dt(machine_last_frame_at),
+            "machine_last_rx_bytes": machine_last_rx_bytes,
             "last_detection_time": runtime_state["last_detection_time"],
             "camera_started_at": runtime_state["camera_started_at"],
             "last_inference_ms": runtime_state["last_inference_ms"],
@@ -911,6 +1365,10 @@ def system_status():
             "model_path": str(model_service.model_path),
             "model_loaded": bool(model_service.model),
             "model_error": model_service.last_error,
+            "model_backend": model_service.backend,
+            "model_imgsz": model_service.imgsz,
+            "model_conf": model_service.conf,
+            "model_warmup_ms": model_service.warmup_ms,
 
             "server_time": bjt_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -930,160 +1388,193 @@ def reload_model():
             "model_path": str(model_service.model_path),
             "model_loaded": bool(model_service.model),
             "model_error": model_service.last_error,
+            "model_backend": model_service.backend,
+            "model_warmup_ms": model_service.warmup_ms,
         }
     ), code
 
 
-@app.get("/api/openmv/ports")
+@app.post("/api/camera/settings")
 @login_required
-def openmv_ports():
+def update_camera_settings():
+    payload = request.get_json(silent=True) or {}
+    resolution = str(payload.get("resolution", camera_settings["resolution"])).upper()
+    if resolution not in {"QVGA", "VGA", "720P", "1080P"}:
+        resolution = "720P"
+    camera_settings["resolution"] = resolution
+    camera_settings["fps"] = min(max(int(payload.get("fps", camera_settings["fps"])), 1), 60)
+    camera_settings["flip_horizontal"] = bool(payload.get("flip_horizontal", camera_settings["flip_horizontal"]))
+    camera_settings["flip_vertical"] = bool(payload.get("flip_vertical", camera_settings["flip_vertical"]))
+    set_config_json("camera_settings", camera_settings)
+    add_log("device", f"更新浏览器摄像头配置: {camera_settings}", current_user.id)
+    return jsonify({"ok": True, "settings": camera_settings})
+
+
+@app.get("/api/device/ports")
+@login_required
+def device_ports():
     ports = []
     if list_ports:
-        ports = [p.device for p in list_ports.comports()]
-    if not ports:
-        ports = ["COM3", "COM4", "/dev/ttyUSB0"]
+        ports = [
+            {
+                "device": port.device,
+                "description": port.description or "串口设备",
+                "manufacturer": port.manufacturer or "",
+            }
+            for port in list_ports.comports()
+        ]
     return jsonify({"ok": True, "ports": ports})
 
 
-@app.post("/api/openmv/connect")
+@app.post("/api/device/connect")
 @login_required
-def openmv_connect():
+def device_connect():
+    global machine_serial_conn, machine_serial_buffer
+    if serial is None:
+        return jsonify({"ok": False, "message": "当前环境未安装 pyserial"}), 500
     payload = request.get_json(silent=True) or {}
-    mode = payload.get("mode", "serial")
-    target = (payload.get("target") or "").strip()
-    if not target:
-        return jsonify({"ok": False, "message": "请填写串口号或 IP 地址"}), 400
+    port = str(payload.get("port") or "").strip()
+    if not port:
+        return jsonify({"ok": False, "message": "请选择串口"}), 400
+    try:
+        baudrate = int(payload.get("baudrate") or machine_settings["baudrate"])
+        timeout_ms = min(max(int(payload.get("timeout_ms") or machine_settings["timeout_ms"]), 50), 5000)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "串口参数格式错误"}), 400
 
-    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
-    openmv_serial_buffer = bytearray()
-    openmv_network_buffer = bytearray()
+    close_machine_serial()
+    try:
+        machine_serial_conn = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=timeout_ms / 1000,
+            write_timeout=timeout_ms / 1000,
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"串口连接失败：{exc}"}), 400
 
-    if mode == "serial":
-        if openmv_network_conn:
-            try:
-                openmv_network_conn.close()
-            except Exception:
-                pass
-            openmv_network_conn = None
-        if not serial:
-            return jsonify({"ok": False, "message": "缺少 pyserial 依赖"}), 500
-        try:
-            openmv_serial_conn = serial.Serial(target, baudrate=openmv_settings["baudrate"], timeout=openmv_settings["serial_timeout"] / 1000)
-        except Exception as exc:
-            runtime_state["openmv_connected"] = False
-            runtime_state["camera_state"] = "未连接"
-            return jsonify({"ok": False, "message": f"串口连接失败: {exc}"}), 400
-    elif mode == "network":
-        if openmv_serial_conn:
-            try:
-                openmv_serial_conn.close()
-            except Exception:
-                pass
-            openmv_serial_conn = None
-
-        if target.startswith("http://") or target.startswith("https://"):
-            pass
-        else:
-            match = re.match(r"^([^:]+):(\d+)$", target)
-            if not match:
-                return jsonify({"ok": False, "message": "网络模式目标格式需为 http(s)://... 或 IP:PORT"}), 400
-            host, port_str = match.groups()
-            try:
-                openmv_network_conn = socket.create_connection((host, int(port_str)), timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5))
-                openmv_network_conn.settimeout(max(openmv_settings["serial_timeout"] / 1000, 0.5))
-            except Exception as exc:
-                runtime_state["openmv_connected"] = False
-                runtime_state["camera_state"] = "未连接"
-                return jsonify({"ok": False, "message": f"网络连接失败: {exc}"}), 400
-    else:
-        return jsonify({"ok": False, "message": "不支持的连接方式"}), 400
-
-    runtime_state["camera_state"] = "已连接"
-    runtime_state["openmv_connected"] = True
-    runtime_state["openmv_mode"] = mode
-    runtime_state["openmv_target"] = target
-    runtime_state["camera_type"] = "openmv"
-    add_log("device", f"OpenMV 已连接: {mode} {target}", current_user.id)
-    return jsonify({"ok": True, "status": "connected", "mode": mode, "target": target, "baudrate": openmv_settings["baudrate"]})
+    machine_serial_buffer = bytearray()
+    machine_settings.update({"port": port, "baudrate": baudrate, "timeout_ms": timeout_ms})
+    runtime_state["machine_connected"] = True
+    set_config_json("machine_settings", machine_settings)
+    add_log("device", f"设备通信模块已连接: {port}@{baudrate}", current_user.id)
+    return jsonify({"ok": True, "connected": True, "settings": machine_settings})
 
 
-@app.post("/api/openmv/disconnect")
+@app.post("/api/device/disconnect")
 @login_required
-def openmv_disconnect():
-    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
-    if openmv_serial_conn:
-        try:
-            openmv_serial_conn.close()
-        except Exception:
-            pass
-        openmv_serial_conn = None
-    if openmv_network_conn:
-        try:
-            openmv_network_conn.close()
-        except Exception:
-            pass
-        openmv_network_conn = None
-    openmv_serial_buffer = bytearray()
-    openmv_network_buffer = bytearray()
-    runtime_state["openmv_connected"] = False
-    runtime_state["camera_state"] = "未连接"
-    runtime_state["openmv_target"] = ""
-    if runtime_state["camera_type"] == "openmv":
+def device_disconnect():
+    close_machine_serial()
+    if runtime_state["camera_type"] == "serial":
+        if runtime_state["camera_started_at"]:
+            add_duration_seconds(
+                datetime.utcfromtimestamp(runtime_state["camera_started_at"]),
+                datetime.utcnow(),
+            )
         runtime_state["camera_on"] = False
         runtime_state["detection_on"] = False
+        runtime_state["camera_state"] = "未连接"
+        runtime_state["camera_label"] = "未选择"
         runtime_state["camera_started_at"] = None
-    add_log("device", "OpenMV 已断开", current_user.id)
-    return jsonify({"ok": True, "status": "disconnected"})
+    add_log("device", "设备通信模块已断开", current_user.id)
+    return jsonify({"ok": True, "connected": False})
 
 
-@app.post("/api/openmv/settings")
+@app.post("/api/device/command")
 @login_required
-def update_openmv_settings():
+def device_command():
+    if not runtime_state["machine_connected"] or not machine_serial_conn:
+        return jsonify({"ok": False, "message": "设备通信模块未连接"}), 400
     payload = request.get_json(silent=True) or {}
-    camera_type = (payload.get("camera_type") or runtime_state.get("camera_type") or "local").strip().lower()
-    if camera_type in {"local", "openmv"}:
-        runtime_state["camera_type"] = camera_type
-    openmv_settings["camera_id"] = int(payload.get("camera_id", openmv_settings.get("camera_id", 0)))
-    openmv_settings["resolution"] = payload.get("resolution", openmv_settings["resolution"])
-    openmv_settings["fps"] = int(payload.get("fps", openmv_settings["fps"]))
-    openmv_settings["baudrate"] = int(payload.get("baudrate", openmv_settings["baudrate"]))
-    openmv_settings["flip_horizontal"] = bool(payload.get("flip_horizontal", openmv_settings["flip_horizontal"]))
-    openmv_settings["flip_vertical"] = bool(payload.get("flip_vertical", openmv_settings["flip_vertical"]))
-    openmv_settings["exposure"] = int(payload.get("exposure", openmv_settings["exposure"]))
-    openmv_settings["gain"] = float(payload.get("gain", openmv_settings["gain"]))
-    openmv_settings["auto_white_balance"] = bool(payload.get("auto_white_balance", openmv_settings["auto_white_balance"]))
-    openmv_settings["serial_timeout"] = int(payload.get("serial_timeout", openmv_settings["serial_timeout"]))
-    global openmv_serial_conn
-    if openmv_serial_conn and openmv_serial_conn.is_open:
-        openmv_serial_conn.baudrate = openmv_settings["baudrate"]
-        openmv_serial_conn.timeout = openmv_settings["serial_timeout"] / 1000
-    set_config_json("openmv_settings", openmv_settings)
-    add_log("device", f"更新 OpenMV 配置: {openmv_settings}", current_user.id)
-    return jsonify({"ok": True, "settings": openmv_settings})
+    command = str(payload.get("command") or "").strip()
+    if not command:
+        return jsonify({"ok": False, "message": "请输入需要发送的指令"}), 400
+    if len(command) > 256:
+        return jsonify({"ok": False, "message": "单条指令不能超过 256 个字符"}), 400
+    try:
+        raw = (command + "\n").encode("utf-8")
+        machine_serial_conn.write(raw)
+        machine_serial_conn.flush()
+    except Exception as exc:
+        close_machine_serial()
+        return jsonify({"ok": False, "message": f"指令发送失败：{exc}"}), 400
+    add_log("device", f"串口发送指令: {command}", current_user.id)
+    return jsonify({"ok": True, "bytes": len(raw), "command": command})
+
+
+@app.get("/api/device/frame")
+@login_required
+def device_frame():
+    global machine_serial_buffer, machine_last_frame_at, machine_last_rx_bytes, machine_last_messages
+    if not runtime_state["machine_connected"] or not machine_serial_conn:
+        return jsonify({"ok": False, "message": "设备通信模块未连接"}), 400
+    try:
+        waiting = int(getattr(machine_serial_conn, "in_waiting", 0) or 0)
+        chunk = machine_serial_conn.read(min(waiting, 262144)) if waiting > 0 else b""
+        if chunk:
+            machine_last_rx_bytes = len(chunk)
+            machine_serial_buffer.extend(chunk)
+        messages = extract_serial_text_messages(machine_serial_buffer)
+        if messages:
+            machine_last_messages = messages[-10:]
+        frame = extract_jpeg_frame(machine_serial_buffer)
+    except Exception as exc:
+        close_machine_serial()
+        return jsonify({"ok": False, "message": f"串口数据读取失败：{exc}"}), 400
+
+    if not frame:
+        return jsonify(
+            {
+                "ok": True,
+                "waiting": True,
+                "message": "等待设备发送 JPEG 图像帧",
+                "buffer_bytes": len(machine_serial_buffer),
+                "rx_bytes": machine_last_rx_bytes,
+                "messages": machine_last_messages,
+            }
+        )
+
+    machine_last_frame_at = datetime.utcnow()
+    if runtime_state["camera_type"] == "serial" and runtime_state["camera_on"]:
+        runtime_state["camera_state"] = "已连接"
+    return jsonify(
+        {
+            "ok": True,
+            "waiting": False,
+            "frame": base64.b64encode(frame).decode("ascii"),
+            "frame_bytes": len(frame),
+            "rx_bytes": machine_last_rx_bytes,
+            "messages": machine_last_messages,
+        }
+    )
 
 
 @app.post("/api/camera/start")
 @login_required
 def start_camera():
     payload = request.get_json(silent=True) or {}
-    camera_type = payload.get("camera_type", "local")
-    if camera_type == "openmv" and not runtime_state["openmv_connected"]:
-        return jsonify({"ok": False, "message": "OpenMV 未连接，请先连接设备"}), 400
-
+    camera_type = str(payload.get("camera_type") or "builtin").strip().lower()
+    if camera_type not in {"builtin", "usb", "serial"}:
+        return jsonify({"ok": False, "message": "不支持的摄像头来源"}), 400
+    if camera_type == "serial" and not runtime_state["machine_connected"]:
+        return jsonify({"ok": False, "message": "请先连接设备通信模块"}), 400
+    camera_label = str(payload.get("camera_label") or "浏览器摄像头").strip()[:120]
     runtime_state["camera_type"] = camera_type
+    runtime_state["camera_label"] = camera_label
     model_service.ensure_loaded(cooldown_sec=0.0)
     runtime_state["camera_on"] = True
-    runtime_state["detection_on"] = True
+    runtime_state["detection_on"] = False
     runtime_state["camera_state"] = "已连接"
     if runtime_state["camera_started_at"] is None:
         runtime_state["camera_started_at"] = time.time()
 
-    add_log("device", f"摄像头已开启({camera_type})并自动开始检测", current_user.id)
+    add_log("device", f"摄像头已开启({camera_label})", current_user.id)
     return jsonify(
         {
             "ok": True,
             "camera_on": True,
             "camera_type": camera_type,
+            "camera_label": camera_label,
 
             "detection_on": runtime_state["detection_on"],
             "model_loaded": bool(model_service.model),
@@ -1105,9 +1596,7 @@ def stop_camera():
     runtime_state["camera_state"] = "未连接"
     runtime_state["camera_started_at"] = None
     runtime_state["last_inference_ms"] = 0
-    if runtime_state["camera_type"] == "openmv":
-        runtime_state["openmv_connected"] = False
-        runtime_state["openmv_target"] = ""
+    runtime_state["camera_label"] = "未选择"
     add_log("device", "摄像头已关闭", current_user.id)
     return jsonify({"ok": True, "camera_on": False})
 
@@ -1117,6 +1606,9 @@ def stop_camera():
 def start_detection():
     if not runtime_state["camera_on"]:
         return jsonify({"ok": False, "message": "请先打开摄像头"}), 400
+
+    if not model_service.ensure_loaded(cooldown_sec=0.0):
+        return jsonify({"ok": False, "message": model_service.last_error or "检测模型未加载"}), 503
 
     runtime_state["detection_on"] = True
     add_log("detection", "目标检测已开启", current_user.id)
@@ -1141,12 +1633,19 @@ def frame_data():
         return jsonify({"ok": True, "boxes": [], "counts": {}, "detection_on": False})
     model_service.ensure_loaded(cooldown_sec=0.0)
     if not model_service.model:
-
-        return jsonify({"ok": True, "boxes": [], "counts": {}, "detection_on": True})
+        return jsonify(
+            {
+                "ok": False,
+                "message": model_service.last_error or "检测模型未加载",
+                "boxes": [],
+                "counts": {},
+                "detection_on": True,
+            }
+        ), 503
 
 
     payload = request.get_json(silent=True) or {}
-    frame_meta = {"source": runtime_state["camera_type"], "openmv": openmv_settings}
+    frame_meta = {"source": runtime_state["camera_type"]}
     frame_b64 = (payload.get("frame") or "").strip()
     frame_provided = bool(frame_b64)
     if frame_b64:
@@ -1154,23 +1653,9 @@ def frame_data():
             frame_b64 = frame_b64.split(",", 1)[1]
         try:
             raw = base64.b64decode(frame_b64)
-            if cv2 is not None:
-                npbuf = np.frombuffer(raw, dtype=np.uint8)
-                frame = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    frame_meta["frame_array"] = frame
-        except Exception:
-            pass
-    if frame_provided and "frame_array" not in frame_meta:
-
-        try:
-            raw = base64.b64decode(frame_b64)
-            if Image is not None:
-                from io import BytesIO
-
-                frame = np.array(Image.open(BytesIO(raw)).convert("RGB"))
-                if frame is not None and frame.size > 0:
-                    frame_meta["frame_array"] = frame
+            frame = decode_image_bytes(raw)
+            if frame is not None:
+                frame_meta["frame_array"] = frame
         except Exception:
             pass
 
@@ -1183,21 +1668,98 @@ def frame_data():
     runtime_state["last_inference_ms"] = round((time.perf_counter() - infer_start) * 1000, 2)
     runtime_state["last_detection_time"] = bjt_now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for category, count in result["counts"].items():
-        avg_conf = sum(b["conf"] for b in result["boxes"] if b["label"] == category) / count
-        db.session.add(
-            DetectionRecord(
-                user_id=current_user.id,
-                category=category,
-                count=count,
-                confidence=round(avg_conf, 2),
-                operator_name=current_user.username,
-                operation_type="目标检测",
-            )
+    record_now = time.time()
+    should_record = (
+        bool(result["counts"])
+        and record_now - runtime_state["last_recorded_detection_at"] >= DETECTION_RECORD_INTERVAL_SECONDS
+    )
+    if should_record:
+        record_detection_result(
+            result,
+            "实时检测",
+            runtime_state["camera_label"],
+            frame_meta.get("frame_array"),
         )
-    db.session.commit()
+        runtime_state["last_recorded_detection_at"] = record_now
 
-    return jsonify({"ok": True, **result, "detection_on": True})
+    return jsonify(
+        {
+            "ok": True,
+            **result,
+            "detection_on": True,
+            "inference_ms": runtime_state["last_inference_ms"],
+            "model_name": model_service.model_name,
+        }
+    )
+
+
+@app.post("/api/image-detection")
+@login_required
+def image_detection():
+    image_file = request.files.get("image")
+    if not image_file or not image_file.filename:
+        return jsonify({"ok": False, "message": "请选择需要检测的图片"}), 400
+
+    raw = image_file.read(MAX_IMAGE_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_IMAGE_UPLOAD_BYTES:
+        return jsonify({"ok": False, "message": "图片过大，请上传 12MB 以内的文件"}), 413
+    frame = decode_image_bytes(raw)
+    if frame is None:
+        return jsonify({"ok": False, "message": "无法解析图片，请使用 JPG、PNG、BMP 或 WebP 格式"}), 400
+    if not model_service.ensure_loaded(cooldown_sec=0.0):
+        return jsonify({"ok": False, "message": model_service.last_error or "检测模型未加载"}), 503
+
+    infer_start = time.perf_counter()
+    result = model_service.predict_from_frame({"source": "image", "frame_array": frame})
+    inference_ms = round((time.perf_counter() - infer_start) * 1000, 2)
+    runtime_state["last_inference_ms"] = inference_ms
+    runtime_state["last_detection_time"] = bjt_now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_filename = Path(image_file.filename).name[:120]
+    if result.get("counts"):
+        record_detection_result(result, "图片检测", f"上传图片：{safe_filename}", frame)
+    add_log(
+        "detection",
+        f"图片检测完成: {safe_filename}，发现 {sum(result.get('counts', {}).values())} 个目标",
+        current_user.id,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            **result,
+            "filename": safe_filename,
+            "inference_ms": inference_ms,
+            "model_name": model_service.model_name,
+        }
+    )
+
+
+@app.post("/api/intelligence/analyze")
+@login_required
+def intelligence_analyze():
+    payload = request.get_json(silent=True) or {}
+    boxes = payload.get("boxes") or []
+    if not isinstance(boxes, list):
+        return jsonify({"ok": False, "message": "研判数据格式错误"}), 400
+    boxes = boxes[:30]
+    frame_width = max(int(payload.get("frame_width") or 1), 1)
+    frame_height = max(int(payload.get("frame_height") or 1), 1)
+    rule_result = build_rule_assessment(boxes, frame_width, frame_height)
+    report, enhanced = request_intelligence_assessment(rule_result)
+    add_log(
+        "analysis",
+        f"完成智能研判，区域数={len(boxes)}，综合风险={rule_result['risk_level']}",
+        current_user.id,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "report": report,
+            "risk_level": rule_result["risk_level"],
+            "findings": rule_result["findings"],
+            "enhanced": enhanced,
+            "message": "智能研判完成" if enhanced else "已使用系统规则库完成研判",
+        }
+    )
 
 
 @app.get("/api/stats/live")
@@ -1241,12 +1803,13 @@ def live_stats():
                     User.last_login_at >= today_start,
                 ).count(),
                 "camera_type": runtime_state["camera_type"],
-                "resolution": openmv_settings["resolution"],
-                "fps": openmv_settings["fps"],
+                "camera_label": runtime_state["camera_label"],
+                "resolution": camera_settings["resolution"],
+                "fps": camera_settings["fps"],
                 "inference_ms": runtime_state["last_inference_ms"],
                 "camera_on": runtime_state["camera_on"],
                 "camera_state": runtime_state["camera_state"],
-                "openmv_settings": openmv_settings,
+                "camera_settings": camera_settings,
             },
             "series_meta": {
                 "categories": sorted(list(category_counter.keys())),
@@ -1283,16 +1846,35 @@ def advanced_stats():
     cate = Counter()
     timeline = []
     grouped = Counter()
+    confidence_grouped = {}
     for r in records:
         cate[r.category] += r.count
         key = to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M")
         grouped[key] += r.count
-    for key in sorted(grouped.keys())[-100:]:
+        confidence_key = (key, r.category)
+        current = confidence_grouped.setdefault(confidence_key, {"sum": 0.0, "count": 0})
+        current["sum"] += float(r.confidence)
+        current["count"] += 1
+    timeline_keys = sorted(grouped.keys())[-100:]
+    for key in timeline_keys:
         timeline.append({"time": key, "value": grouped[key], "dist": dict(cate)})
 
     bar_data = []
     for name, value in cate.items():
         bar_data.append({"name": name, "value": value})
+
+    confidence_categories = sorted({r.category for r in records})
+    confidence_series = []
+    for category_name in confidence_categories:
+        values = []
+        for key in timeline_keys:
+            bucket = confidence_grouped.get((key, category_name))
+            values.append(
+                round(bucket["sum"] / bucket["count"] * 100, 2)
+                if bucket and bucket["count"]
+                else None
+            )
+        confidence_series.append({"name": category_name, "data": values})
 
     return jsonify(
         {
@@ -1300,6 +1882,10 @@ def advanced_stats():
             "timeline": timeline,
             "pie": [{"name": n, "value": v} for n, v in cate.items()],
             "bar": bar_data,
+            "confidence_trend": {
+                "times": timeline_keys,
+                "series": confidence_series,
+            },
             "categories": sorted(list({r.category for r in scoped_detection_query().all()})),
             "total": total,
             "range": {"start": to_bjt(start).isoformat(sep=" "), "end": to_bjt(end).isoformat(sep=" ")},
@@ -1345,6 +1931,7 @@ def export_stats():
             "confidence": r.confidence,
             "operator": r.operator_name,
             "operation_type": r.operation_type,
+            "has_image": bool(r.image_path),
         }
         for r in records
     ]
@@ -1379,8 +1966,22 @@ def export_stats():
 def clear_history():
     if not current_user.is_admin:
         return jsonify({"ok": False, "message": "forbidden"}), 403
+    image_paths = [
+        Path(path).name
+        for (path,) in db.session.query(DetectionRecord.image_path)
+        .filter(DetectionRecord.image_path != "")
+        .distinct()
+        .all()
+    ]
     DetectionRecord.query.delete()
     db.session.commit()
+    for image_path in image_paths:
+        target = DETECTION_IMAGE_DIR / image_path
+        if target.exists() and target.is_file():
+            try:
+                target.unlink()
+            except OSError:
+                app.logger.warning("无法删除检测图片: %s", target)
     add_log("admin", "管理员清空全部检测记录", current_user.id)
     return jsonify({"ok": True})
 
@@ -1431,6 +2032,7 @@ def get_history():
             "confidence": r.confidence,
             "operator": r.operator_name,
             "operation_type": r.operation_type,
+            "has_image": bool(r.image_path),
         }
         for r in records
     ]
@@ -1501,6 +2103,7 @@ def delete_history(record_id: int):
         return jsonify({"ok": False, "message": "forbidden"}), 403
 
     record = DetectionRecord.query.get_or_404(record_id)
+    delete_detection_image_if_unused(record)
     db.session.delete(record)
     db.session.commit()
     add_log("admin", f"管理员删除历史记录 ID={record_id}", current_user.id)
@@ -1513,6 +2116,7 @@ def delete_history_self(record_id: int):
     record = DetectionRecord.query.get_or_404(record_id)
     if (not current_user.is_admin) and record.user_id != current_user.id:
         return jsonify({"ok": False, "message": "forbidden"}), 403
+    delete_detection_image_if_unused(record)
     db.session.delete(record)
     db.session.commit()
     add_log("history", f"删除历史记录 ID={record_id}", current_user.id)
@@ -1654,7 +2258,6 @@ def account_me():
         }
     )
 
-
 @app.post("/api/account/profile")
 @login_required
 def update_account_profile():
@@ -1694,68 +2297,46 @@ def history_detail(record_id: int):
     r = DetectionRecord.query.get_or_404(record_id)
     if (not current_user.is_admin) and r.user_id != current_user.id:
         return jsonify({"ok": False, "message": "forbidden"}), 403
-    return jsonify({"ok": True, "record": {"id": r.id, "time": to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M:%S"), "category": r.category, "count": r.count, "confidence": r.confidence, "operator": r.operator_name, "operation_type": r.operation_type, "note": r.note}})
+    try:
+        boxes = json.loads(r.boxes_json or "[]")
+        if not isinstance(boxes, list):
+            boxes = []
+    except json.JSONDecodeError:
+        boxes = []
+    image_file = DETECTION_IMAGE_DIR / Path(r.image_path or "").name
+    has_image = bool(r.image_path and image_file.exists() and image_file.is_file())
+    return jsonify(
+        {
+            "ok": True,
+            "record": {
+                "id": r.id,
+                "time": to_bjt(r.detect_time).strftime("%Y-%m-%d %H:%M:%S"),
+                "category": r.category,
+                "count": r.count,
+                "confidence": r.confidence,
+                "operator": r.operator_name,
+                "operation_type": r.operation_type,
+                "note": r.note,
+                "has_image": has_image,
+                "image_url": url_for("history_image", record_id=r.id) if has_image else "",
+                "boxes": boxes,
+                "frame_width": r.frame_width,
+                "frame_height": r.frame_height,
+            },
+        }
+    )
 
 
-@app.get("/api/openmv/frame")
+@app.get("/api/history/<int:record_id>/image")
 @login_required
-def openmv_frame():
-    if not runtime_state["camera_on"] or runtime_state["camera_type"] != "openmv":
-        return jsonify({"ok": False, "message": "摄像头未开启"}), 400
-    frame = b""
-    global openmv_serial_conn, openmv_network_conn, openmv_serial_buffer, openmv_network_buffer
-    if runtime_state["openmv_mode"] == "serial" and openmv_serial_conn and openmv_serial_conn.is_open:
-        try:
-            raw = openmv_serial_conn.read(8192)
-            if raw:
-                openmv_serial_buffer.extend(raw)
-                frame = extract_jpeg_frame(openmv_serial_buffer)
-        except Exception as exc:
-            runtime_state["camera_state"] = "未连接"
-            runtime_state["openmv_connected"] = False
-            return jsonify({"ok": False, "message": f"串口读取失败: {exc}"}), 400
-
-    if runtime_state["openmv_mode"] == "network" and runtime_state["openmv_target"]:
-        target = runtime_state["openmv_target"]
-        try:
-            if target.startswith("http://") or target.startswith("https://"):
-                with urllib.request.urlopen(target, timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5)) as resp:
-                    chunk = resp.read(65536)
-                openmv_network_buffer.extend(chunk)
-                frame = extract_jpeg_frame(openmv_network_buffer)
-                if not frame and b"\xff\xd8" in chunk and b"\xff\xd9" in chunk:
-                    s = chunk.find(b"\xff\xd8")
-                    e = chunk.find(b"\xff\xd9", s + 2)
-                    if e > s:
-                        frame = chunk[s : e + 2]
-            else:
-                if not openmv_network_conn:
-                    host, port_str = target.rsplit(":", 1)
-                    openmv_network_conn = socket.create_connection((host, int(port_str)), timeout=max(openmv_settings["serial_timeout"] / 1000, 0.5))
-                    openmv_network_conn.settimeout(max(openmv_settings["serial_timeout"] / 1000, 0.5))
-                raw = openmv_network_conn.recv(8192)
-                if raw:
-                    openmv_network_buffer.extend(raw)
-                    frame = extract_jpeg_frame(openmv_network_buffer)
-        except Exception as exc:
-            runtime_state["camera_state"] = "未连接"
-            runtime_state["openmv_connected"] = False
-            return jsonify({"ok": False, "message": f"网络视频流读取失败: {exc}"}), 400
-
-    if not frame:
-        return jsonify(
-            {
-                "ok": False,
-                "message": "未收到有效视频帧，请检查 OpenMV 脚本是否在发送 JPEG 帧，以及目标地址/端口是否正确",
-                "target": runtime_state["openmv_target"],
-                "mode": runtime_state["openmv_mode"],
-            }
-        ), 400
-    runtime_state["openmv_last_frame_at"] = datetime.utcnow()
-    runtime_state["openmv_last_len"] = len(frame)
-    runtime_state["camera_state"] = "已连接"
-    app.logger.info("OpenMV RX len=%s header=%s footer=%s", len(frame), frame[:2].hex(), frame[-2:].hex())
-    return jsonify({"ok": True, "encoding": "base64", "frame": base64.b64encode(frame).decode("ascii"), "len": len(frame), "header": frame[:2].hex(), "footer": frame[-2:].hex()})
+def history_image(record_id: int):
+    record = DetectionRecord.query.get_or_404(record_id)
+    if (not current_user.is_admin) and record.user_id != current_user.id:
+        return jsonify({"ok": False, "message": "forbidden"}), 403
+    filename = Path(record.image_path or "").name
+    if not filename or not (DETECTION_IMAGE_DIR / filename).exists():
+        return jsonify({"ok": False, "message": "该记录没有保存检测图片"}), 404
+    return send_from_directory(DETECTION_IMAGE_DIR, filename, conditional=True)
 
 
 if __name__ == "__main__":
@@ -1763,4 +2344,5 @@ if __name__ == "__main__":
     print("Local:   http://127.0.0.1:5000")
     print("All NIC: http://0.0.0.0:5000")
     print(f"LAN:     http://{lan_ip}:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug_mode = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=5000, debug=debug_mode)

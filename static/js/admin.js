@@ -185,21 +185,14 @@ document.getElementById('openCreateUser').onclick = async () => {
   if (res.ok) refreshAdmin();
 };
 
-document.getElementById('saveOpenmvCfg').onclick = async () => {
+document.getElementById('saveCameraCfg').onclick = async () => {
   const payload = {
-    camera_type: document.getElementById('cfgCameraType').value,
-    camera_id: Number(document.getElementById('cfgCameraId').value || 0),
     resolution: document.getElementById('cfgRes').value,
-    fps: Number(document.getElementById('cfgFps').value || 15),
-    baudrate: Number(document.getElementById('cfgBaud').value || 115200),
-    exposure: Number(document.getElementById('cfgExposure').value || 50),
-    gain: Number(document.getElementById('cfgGain').value || 1.0),
-    serial_timeout: Number(document.getElementById('cfgTimeout').value || 800),
-    auto_white_balance: document.getElementById('cfgAwb').checked,
+    fps: Number(document.getElementById('cfgFps').value || 20),
     flip_horizontal: document.getElementById('cfgFlipH').checked,
     flip_vertical: document.getElementById('cfgFlipV').checked,
   };
-  const res = await fetch('/api/openmv/settings', {
+  const res = await fetch('/api/camera/settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -213,16 +206,9 @@ async function loadCameraConfig() {
     if (!res.ok) return;
     const data = await res.json();
     if (!data.ok) return;
-    const cfg = data.openmv_settings || {};
-  document.getElementById('cfgCameraType').value = data.camera_type || 'local';
-  document.getElementById('cfgCameraId').value = cfg.camera_id ?? 0;
+    const cfg = data.camera_settings || {};
   document.getElementById('cfgRes').value = cfg.resolution || '720P';
-  document.getElementById('cfgFps').value = cfg.fps || 15;
-  document.getElementById('cfgBaud').value = cfg.baudrate || 115200;
-  document.getElementById('cfgExposure').value = cfg.exposure ?? 50;
-  document.getElementById('cfgGain').value = cfg.gain ?? 1.0;
-  document.getElementById('cfgTimeout').value = cfg.serial_timeout || 800;
-  document.getElementById('cfgAwb').checked = !!cfg.auto_white_balance;
+  document.getElementById('cfgFps').value = cfg.fps || 20;
   document.getElementById('cfgFlipH').checked = !!cfg.flip_horizontal;
   document.getElementById('cfgFlipV').checked = !!cfg.flip_vertical;
   } catch (e) {

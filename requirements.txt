@@ -1,4 +1,4 @@
-# GUI_YOLOv5 unified requirements (pip)
+# YOLOv8 + OpenVINO Flask monitoring requirements (pip)
 
 # Compatible target: Python 3.9/3.10 (Windows/Linux/macOS)
 
@@ -10,7 +10,7 @@ Werkzeug>=3.0,<3.1
 pyserial>=3.5,<4
 gunicorn>=21,<23
 
-# ===== YOLOv5 core =====
+# ===== YOLOv8 / OpenVINO inference =====
 # NOTE:
 # - scipy 1.10.x requires numpy <1.27
 # - opencv-python 4.12.x on py>=3.9 prefers numpy>=2 and may conflict with scipy
@@ -22,8 +22,10 @@ PyYAML>=6.0,<7
 requests>=2.31,<3
 scipy>=1.10,<1.12
 
-torch==2.0.1
-torchvision==0.15.2
+torch>=2.0,<3
+torchvision>=0.15,<1
+ultralytics>=8.2,<9
+openvino>=2024.6,<2027
 tqdm>=4.64,<5
 thop>=0.1.1.post2209072238
 

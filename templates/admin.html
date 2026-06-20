@@ -10,20 +10,14 @@
 </div>
 
 <div class="card p-3 mt-3 panel-anim">
-  <h5>摄像头配置</h5>
+  <h5>浏览器摄像头默认配置</h5>
+  <div class="small text-muted mb-2">实时检测页可在电脑内置摄像头和 USB 外接摄像头之间切换；这里设置默认画面参数。</div>
   <div class="row g-2 align-items-end">
-    <div class="col-md-2"><label class="form-label">摄像头 ID</label><input class="form-control" type="number" id="cfgCameraId" value="0" min="0"></div>
-    <div class="col-md-2"><label class="form-label">摄像头类型</label><select class="form-select" id="cfgCameraType"><option value="local">本地</option><option value="openmv">OpenMV</option></select></div>
-    <div class="col-md-2"><label class="form-label">分辨率</label><select class="form-select" id="cfgRes"><option>720P</option><option>1080P</option></select></div>
-    <div class="col-md-2"><label class="form-label">帧率</label><select class="form-select" id="cfgFps"><option>15</option><option>30</option></select></div>
-    <div class="col-md-2"><label class="form-label">波特率</label><input class="form-control" type="number" id="cfgBaud" value="115200"></div>
-    <div class="col-md-2"><label class="form-label">曝光</label><input class="form-control" type="number" id="cfgExposure" value="50"></div>
-    <div class="col-md-2"><label class="form-label">增益</label><input class="form-control" type="number" step="0.1" id="cfgGain" value="1.0"></div>
-    <div class="col-md-2"><label class="form-label">窗口超时(ms)</label><input class="form-control" type="number" id="cfgTimeout" value="800"></div>
+    <div class="col-md-3"><label class="form-label">分辨率</label><select class="form-select" id="cfgRes"><option>VGA</option><option>720P</option><option>1080P</option></select></div>
+    <div class="col-md-3"><label class="form-label">目标帧率</label><input class="form-control" type="number" min="1" max="60" id="cfgFps" value="20"></div>
     <div class="col-md-2 form-check mt-4"><input class="form-check-input" type="checkbox" id="cfgFlipH"><label class="form-check-label" for="cfgFlipH">水平翻转</label></div>
     <div class="col-md-2 form-check mt-4"><input class="form-check-input" type="checkbox" id="cfgFlipV"><label class="form-check-label" for="cfgFlipV">垂直翻转</label></div>
-    <div class="col-md-2 form-check mt-4"><input class="form-check-input" type="checkbox" id="cfgAwb" checked><label class="form-check-label" for="cfgAwb">自动白平衡</label></div>
-    <div class="col-md-2"><button class="btn btn-primary" id="saveOpenmvCfg">保存配置</button></div>
+    <div class="col-md-2"><button class="btn btn-primary w-100" id="saveCameraCfg">保存配置</button></div>
   </div>
 </div>
 

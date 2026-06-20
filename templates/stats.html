@@ -25,7 +25,7 @@
 <div class="row g-3">
   <div class="col-lg-6"><div class="card p-3"><h6>检测数量趋势</h6><div id="lineChart" style="height:340px;"></div><div id="linePlaceholder" class="placeholder-panel d-none"><strong>暂无趋势数据</strong><span>当前没有检测记录。开始检测后将展示按时间变化趋势。</span></div></div></div>
   <div class="col-lg-6"><div class="card p-3"><h6>类别分布</h6><div id="pieChart" style="height:340px;"></div><div id="piePlaceholder" class="placeholder-panel d-none"><strong>暂无类别分布</strong><span>可先开启摄像头并启动检测，系统将自动汇总占比。</span></div></div></div>
-  <div class="col-12"><div class="card p-3"><h6>类别对比</h6><div id="barChart" style="height:360px;"></div><div id="barPlaceholder" class="placeholder-panel d-none"><strong>暂无类别对比</strong><span>当前无模型输出或无历史数据，稍后重试。</span></div></div></div>
+  <div class="col-12"><div class="card p-3"><h6>各类别置信度动态趋势</h6><div class="small text-muted mb-2">按时间展示不同缺陷类别的平均识别置信度，可缩放查看局部波动。</div><div id="confidenceChart" style="height:380px;"></div><div id="confidencePlaceholder" class="placeholder-panel d-none"><strong>暂无置信度趋势</strong><span>完成检测后，这里会动态展示各类别置信度变化。</span></div></div></div>
 </div>
 {% endblock %}
 {% block scripts %}

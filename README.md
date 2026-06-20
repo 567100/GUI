@@ -4,7 +4,9 @@
 - 用户注册 / 登录 / 持久化记忆（SQLite）
 - 登录保护：未登录不可访问监控系统
 - 5 大页面：登录、实时监控、数据统计、历史记录、管理员
-- 摄像头调用（浏览器 `getUserMedia`）
+- 三种采集来源：电脑内置摄像头、USB 外接摄像头、串口设备通信模块
+- 图片上传检测与检测框交互
+- 坑状缺陷、条状缺陷智能研判与处置建议
 - YOLO 检测接口预留（当前返回模拟数据）
 - 实时动态折线图、饼图、柱状图 + 今日统计卡片
 - 历史记录按时间倒序、关键词筛选、时间区间筛选、分页
@@ -45,31 +47,89 @@ pip install -r requirements.txt
 python app.py
 ```
 
+如果使用 Conda 环境：
+
+```bash
+conda activate py310_yolov5
+python -m pip install "openvino>=2024.6,<2027"
+python app.py
+```
+
 启动后控制台会显示：
 - `http://127.0.0.1:5000`
 - `http://0.0.0.0:5000`
 - `http://你的局域网IP:5000`（同一 WiFi 手机/平板可访问）
 
 ## 4. 默认管理员账号
-- 用户名：`admin`
-- 密码：`admin123456`
+- 用户名：`rtxq`
+- 密码：`rtxq123456`
 
-## 5. 模型替换接口（最关键）
-你只需要改一个地方：`app.py` 里的 `YoloModelService.predict_from_frame()`。
+## 5. OpenVINO 模型与实时检测
 
-### 建议步骤
-1. 把训练好的模型放到项目根目录：`best.pt`
-2. 在 `predict_from_frame()` 里加载你自己的 YOLO 模型
-3. 输出格式保持不变：
-```python
-{
-  "boxes": [
-    {"x": 120, "y": 90, "w": 160, "h": 180, "label": "person", "conf": 0.87}
-  ],
-  "counts": {"person": 2, "car": 1}
-}
+当前项目默认优先加载：
+
+```text
+models/best_openvino_model/
+├── best.xml
+├── best.bin
+└── metadata.yaml
 ```
-4. 前端会自动显示框、类别、置信度、实时数量，并写入数据库
+
+如果 OpenVINO 目录不存在，会自动回退到 `models/best.pt`。也可以通过环境变量
+`YOLO_MODEL_PATH` 指定其他模型路径。
+
+重新训练并替换 `models/best.pt` 后，执行：
+
+```bash
+python export_openvino.py
+```
+
+默认导出 640×640、静态 batch=1、FP16 压缩的 OpenVINO IR 模型。需要 FP32 时：
+
+```bash
+python export_openvino.py --fp32
+```
+
+启动应用后，服务会提前加载并预热 OpenVINO 模型。网页端打开摄像头并点击“开始检测”后，
+会将缩放后的当前帧发送到 Flask 后端推理，前端自动绘制检测框、类别、置信度和数量。
+
+左侧“实时监控”菜单包含两个模式：
+
+- 实时检测：选择电脑内置或 USB 外接摄像头进行连续检测
+- 图片检测：上传单张图片，点选检测区域并生成智能研判报告
+
+实时检测页支持三种采集来源：
+
+- 电脑内置摄像头：通过浏览器 `getUserMedia` 采集
+- USB 外接摄像头：自动从浏览器视频设备中筛选外接设备
+- 设备通信模块：通过串口连接单片机、工控机或视觉模块，可发送文本控制指令并接收 JPEG 图像
+
+串口图像协议采用标准 JPEG 帧边界：设备直接发送从 `FF D8` 开始、以 `FF D9`
+结束的完整 JPEG 二进制数据。控制指令由服务端以 UTF-8 文本加换行符发送。
+传输图像时建议使用 `460800` 或 `921600` 波特率。
+
+可选环境变量：
+
+- `YOLO_MODEL_PATH`：模型目录或权重文件路径
+- `YOLO_IMGSZ`：推理输入尺寸，默认 `640`
+- `YOLO_CONF`：置信度阈值，默认 `0.25`
+- `YOLO_IOU`：NMS IoU 阈值，默认 `0.45`
+- `YOLO_WARMUP=0`：关闭启动时预热
+- `DETECTION_RECORD_INTERVAL_SECONDS`：实时检测历史写库间隔，默认 `5.0` 秒
+- `DETECTION_IMAGE_JPEG_QUALITY`：历史缩略图 JPEG 质量，默认 `40`
+- `DETECTION_IMAGE_MAX_SIZE`：历史缩略图最长边尺寸，默认 `320` 像素，并保持原始宽高比例
+- `DETECTION_IMAGE_MIN_CONFIDENCE`：保存历史图片的最低平均置信度，默认 `0.65`；低于该值只保存数据
+
+智能研判接口使用服务端环境变量，密钥不会发送到浏览器：
+
+```powershell
+$env:INTELLIGENCE_API_KEY="你的 API Key"
+$env:INTELLIGENCE_API_BASE="https://api.deepseek.com"
+$env:INTELLIGENCE_MODEL="deepseek-v4-flash"
+python app.py
+```
+
+未配置 API Key 时，系统会自动使用内置缺陷规则库生成基础研判，不影响图片检测功能。
 
 ## 6. 数据记忆说明
 SQLite 文件：`instance/yolo_monitor.db`
@@ -86,7 +146,9 @@ SQLite 文件：`instance/yolo_monitor.db`
 - `POST /api/camera/stop` 关闭摄像头状态
 - `POST /api/detection/start` 开始检测状态
 - `POST /api/detection/stop` 停止检测状态
-- `GET /api/detection/frame-data` 获取本帧检测结果（占位接口）
+- `POST /api/detection/frame-data` 使用 OpenVINO 获取本帧真实检测结果
+- `POST /api/image-detection` 上传图片并返回检测框
+- `POST /api/intelligence/analyze` 对全部或选中的检测框生成智能研判
 - `GET /api/stats/live` 获取动态图表数据
 - `GET /api/history` 获取历史记录（支持筛选+分页）
 - `GET /api/admin/overview` 获取管理员总览

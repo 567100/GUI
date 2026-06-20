@@ -1,55 +1,55 @@
 const video = document.getElementById('video');
-const openmvImage = document.getElementById('openmvImage');
+const serialImage = document.getElementById('serialImage');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
+const sourceType = document.getElementById('cameraSourceType');
+const cameraDeviceSelect = document.getElementById('cameraDeviceSelect');
+const cameraDeviceHint = document.getElementById('cameraDeviceHint');
+const serialStatusText = document.getElementById('serialStatusText');
 const countList = document.getElementById('countList');
 const statusText = document.getElementById('statusText');
 const cameraMeta = document.getElementById('cameraMeta');
 const perfMeta = document.getElementById('perfMeta');
 const modelMeta = document.getElementById('modelMeta');
-const cameraType = document.getElementById('cameraType');
-const openmvPanel = document.getElementById('openmvPanel');
-const openmvConnStatus = document.getElementById('openmvConnStatus');
 
 let stream = null;
-let timer = null;
-let frameTimer = null;
+let allVideoDevices = [];
+let detectionTimer = null;
+let serialFrameTimer = null;
 let durationTimer = null;
+let detectionRequestInFlight = false;
 let durationBaseSeconds = 0;
 let durationBaseAt = Date.now();
 let durationCameraOn = false;
-let configSyncPausedUntil = 0;
+let lastBoxes = [];
+let lastFrameSize = { width: 0, height: 0 };
+let serialConnected = false;
 
-function stopLocalStream() {
-  if (!stream) return;
-  stream.getTracks().forEach((t) => t.stop());
-  stream = null;
-}
-
-function isConfigEditing() {
-  const ids = [
-    'cfgResolution', 'cfgFps', 'cfgExposure', 'cfgGain', 'cfgBaudrate', 'cfgTimeout',
-    'cfgAwb', 'cfgFlipH', 'cfgFlipV', 'cameraType',
-  ];
-  return ids.some((id) => document.activeElement === document.getElementById(id));
-}
+const DETECTION_INTERVAL_MS = 350;
+const SERIAL_FRAME_INTERVAL_MS = 180;
+const DETECTION_FRAME_MAX_SIZE = 640;
 
 async function postApi(url, payload) {
-  const res = await fetch(url, {
+  const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: payload ? JSON.stringify(payload) : null,
   });
-  const data = await res.json().catch(() => ({ ok: false, message: '接口返回异常' }));
-  if (!res.ok) return { ok: false, message: data.message || `请求失败(${res.status})` };
+  const data = await response.json().catch(() => ({ ok: false, message: '接口返回异常' }));
+  if (handleAuthExpiryResponse(response, data)) return { ok: false, message: '登录已失效' };
+  if (!response.ok) return { ok: false, message: data.message || `请求失败(${response.status})` };
   return data;
 }
 
+function activePreviewElement() {
+  return sourceType.value === 'serial' ? serialImage : video;
+}
+
 function formatDuration(ms) {
-  const sec = Math.max(0, Math.floor(ms / 1000));
-  const h = String(Math.floor(sec / 3600)).padStart(2, '0');
-  const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
-  const s = String(sec % 60).padStart(2, '0');
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const h = String(Math.floor(seconds / 3600)).padStart(2, '0');
+  const m = String(Math.floor((seconds % 3600) / 60)).padStart(2, '0');
+  const s = String(seconds % 60).padStart(2, '0');
   return `${h}:${m}:${s}`;
 }
 
@@ -69,21 +69,266 @@ function syncDuration(baseSeconds = 0, cameraOn = false) {
   if (!durationTimer) durationTimer = setInterval(renderDurationTick, 1000);
 }
 
-function drawBoxes(boxes = []) {
-  const target = cameraType.value === 'openmv' ? openmvImage : video;
-  overlay.width = target.clientWidth || video.clientWidth;
-  overlay.height = target.clientHeight || video.clientHeight;
-  ctx.clearRect(0, 0, overlay.width, overlay.height);
+function stopBrowserStream() {
+  if (stream) stream.getTracks().forEach((track) => track.stop());
+  stream = null;
+  video.srcObject = null;
+}
+
+function isUsbCamera(device, index) {
+  const label = (device.label || '').toLowerCase();
+  if (/usb|external|logitech|webcam|外接|camera 2|摄像头 2/.test(label)) return true;
+  if (/integrated|built.?in|facetime|front|内置/.test(label)) return false;
+  return index > 0;
+}
+
+function filteredVideoDevices() {
+  if (sourceType.value === 'usb') {
+    return allVideoDevices.filter((device, index) => isUsbCamera(device, index));
+  }
+  return allVideoDevices.filter((device, index) => !isUsbCamera(device, index));
+}
+
+function renderCameraDevices() {
+  const devices = filteredVideoDevices();
+  const previous = cameraDeviceSelect.value;
+  cameraDeviceSelect.innerHTML = '';
+  if (!devices.length) {
+    const label = sourceType.value === 'usb' ? '未发现 USB 外接摄像头' : '未发现电脑内置摄像头';
+    cameraDeviceSelect.innerHTML = `<option value="">${label}</option>`;
+    cameraDeviceHint.textContent = `${label}，请检查设备连接和浏览器权限。`;
+    return;
+  }
+  devices.forEach((device, index) => {
+    const option = document.createElement('option');
+    option.value = device.deviceId;
+    option.dataset.rawLabel = device.label || `${sourceType.value === 'usb' ? 'USB 摄像头' : '内置摄像头'} ${index + 1}`;
+    option.textContent = option.dataset.rawLabel;
+    cameraDeviceSelect.appendChild(option);
+  });
+  if ([...cameraDeviceSelect.options].some((option) => option.value === previous)) {
+    cameraDeviceSelect.value = previous;
+  }
+  cameraDeviceHint.textContent = sourceType.value === 'usb'
+    ? `已发现 ${devices.length} 个 USB/外接摄像头。`
+    : `已发现 ${devices.length} 个电脑内置/默认摄像头。`;
+}
+
+async function enumerateCameras(requestPermission = false) {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    cameraDeviceHint.textContent = '当前浏览器不支持摄像头设备枚举。';
+    return;
+  }
+  let permissionStream = null;
+  if (requestPermission && !stream) {
+    permissionStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  }
+  allVideoDevices = (await navigator.mediaDevices.enumerateDevices())
+    .filter((device) => device.kind === 'videoinput');
+  permissionStream?.getTracks().forEach((track) => track.stop());
+  renderCameraDevices();
+}
+
+function currentCameraLabel() {
+  const option = cameraDeviceSelect.selectedOptions[0];
+  return option?.dataset.rawLabel || option?.textContent || '浏览器摄像头';
+}
+
+function cameraConstraints() {
+  const resolution = document.getElementById('cfgResolution').value;
+  const fps = Number(document.getElementById('cfgFps').value || 20);
+  const sizeMap = {
+    VGA: { width: 640, height: 480 },
+    '720P': { width: 1280, height: 720 },
+    '1080P': { width: 1920, height: 1080 },
+  };
+  const size = sizeMap[resolution] || sizeMap['720P'];
+  return {
+    deviceId: cameraDeviceSelect.value ? { exact: cameraDeviceSelect.value } : undefined,
+    width: { ideal: size.width },
+    height: { ideal: size.height },
+    frameRate: { ideal: fps, max: fps },
+  };
+}
+
+function applyMirrorTransform() {
+  const sx = document.getElementById('cfgFlipH').checked ? -1 : 1;
+  const sy = document.getElementById('cfgFlipV').checked ? -1 : 1;
+  const transform = `scale(${sx}, ${sy})`;
+  video.style.transform = transform;
+  serialImage.style.transform = transform;
+  overlay.style.transform = transform;
+}
+
+function updateSourcePanels() {
+  const serialMode = sourceType.value === 'serial';
+  document.getElementById('browserCameraPanel').classList.toggle('d-none', serialMode);
+  document.getElementById('serialDevicePanel').classList.toggle('d-none', !serialMode);
+  video.classList.toggle('d-none', serialMode);
+  serialImage.classList.toggle('d-none', !serialMode);
+  document.getElementById('serialWaiting').classList.toggle('d-none', !serialMode || !!serialImage.src);
+  if (!serialMode) renderCameraDevices();
+  drawBoxes();
+}
+
+async function scanSerialPorts() {
+  const response = await fetch('/api/device/ports');
+  const data = await response.json();
+  const select = document.getElementById('serialPortSelect');
+  select.innerHTML = '';
+  if (!data.ok || !data.ports?.length) {
+    select.innerHTML = '<option value="">未发现可用串口</option>';
+    serialStatusText.textContent = '未发现串口设备，请检查 USB 转串口驱动和设备连接。';
+    return;
+  }
+  data.ports.forEach((port) => {
+    const option = document.createElement('option');
+    option.value = port.device;
+    option.textContent = `${port.device} — ${port.description || '串口设备'}`;
+    select.appendChild(option);
+  });
+  serialStatusText.textContent = `已发现 ${data.ports.length} 个串口设备。`;
+}
+
+async function connectSerialDevice() {
+  const port = document.getElementById('serialPortSelect').value;
+  const baudrate = Number(document.getElementById('serialBaudrate').value || 115200);
+  const data = await postApi('/api/device/connect', { port, baudrate, timeout_ms: 300 });
+  if (!data.ok) {
+    showToast(data.message || '串口连接失败', 'danger');
+    return;
+  }
+  serialConnected = true;
+  serialStatusText.textContent = `已连接 ${port}，波特率 ${baudrate}，等待设备数据。`;
+  startSerialFramePolling();
+  showToast('设备通信模块连接成功');
+}
+
+async function disconnectSerialDevice() {
+  await postApi('/api/device/disconnect');
+  serialConnected = false;
+  stopSerialFramePolling();
+  serialImage.removeAttribute('src');
+  document.getElementById('serialWaiting').classList.remove('d-none');
+  serialStatusText.textContent = '设备通信模块已断开。';
+  ensureDetectionPolling(false);
+  showToast('设备通信模块已断开', 'secondary');
+}
+
+async function sendSerialCommand() {
+  const command = document.getElementById('serialCommand').value.trim();
+  const data = await postApi('/api/device/command', { command });
+  if (!data.ok) {
+    showToast(data.message || '指令发送失败', 'danger');
+    return;
+  }
+  serialStatusText.textContent = `已发送：${data.command}（${data.bytes} 字节）`;
+  showToast('设备指令已发送');
+}
+
+async function pollSerialFrame() {
+  if (!serialConnected || sourceType.value !== 'serial') return;
+  try {
+    const response = await fetch('/api/device/frame');
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      serialStatusText.textContent = data.message || '串口读取失败';
+      return;
+    }
+    if (data.waiting) {
+      const reply = data.messages?.length ? `；设备回复：${data.messages.at(-1)}` : '';
+      serialStatusText.textContent = `${data.message}；缓冲区 ${data.buffer_bytes || 0} 字节${reply}`;
+      return;
+    }
+    serialImage.src = `data:image/jpeg;base64,${data.frame}`;
+    document.getElementById('serialWaiting').classList.add('d-none');
+    const reply = data.messages?.length ? `；设备回复：${data.messages.at(-1)}` : '';
+    serialStatusText.textContent = `已接收图像帧：${data.frame_bytes} 字节；最近接收 ${data.rx_bytes} 字节${reply}`;
+  } catch (error) {
+    serialStatusText.textContent = '设备通信连接异常';
+  }
+}
+
+function startSerialFramePolling() {
+  if (!serialFrameTimer) {
+    serialFrameTimer = setInterval(pollSerialFrame, SERIAL_FRAME_INTERVAL_MS);
+    pollSerialFrame();
+  }
+}
+
+function stopSerialFramePolling() {
+  if (serialFrameTimer) clearInterval(serialFrameTimer);
+  serialFrameTimer = null;
+}
+
+async function openSelectedSource() {
+  const type = sourceType.value;
+  if (type === 'serial') {
+    if (!serialConnected) {
+      showToast('请先连接设备通信模块', 'warning');
+      return;
+    }
+    stopBrowserStream();
+    startSerialFramePolling();
+    const response = await postApi('/api/camera/start', {
+      camera_type: 'serial',
+      camera_label: `串口视觉设备 ${document.getElementById('serialPortSelect').value}`,
+    });
+    if (!response.ok) {
+      showToast(response.message || '采集源开启失败', 'danger');
+      return;
+    }
+    statusText.textContent = '状态：串口采集已开启，等待开始检测';
+    await refreshSystem();
+    return;
+  }
+
+  stopBrowserStream();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: cameraConstraints(), audio: false });
+    video.srcObject = stream;
+    await video.play();
+    applyMirrorTransform();
+    const response = await postApi('/api/camera/start', {
+      camera_type: type,
+      camera_label: currentCameraLabel(),
+    });
+    if (!response.ok) throw new Error(response.message || '服务端状态开启失败');
+    statusText.textContent = '状态：摄像头已开启，等待开始检测';
+    showToast(type === 'usb' ? 'USB 摄像头已开启' : '电脑内置摄像头已开启');
+    await refreshSystem();
+  } catch (error) {
+    stopBrowserStream();
+    showToast(`摄像头打开失败：${error.message || '请检查权限或设备占用'}`, 'danger');
+  }
+}
+
+function drawBoxes(boxes = lastBoxes, frameWidth = lastFrameSize.width, frameHeight = lastFrameSize.height) {
+  const target = activePreviewElement();
+  const width = target.clientWidth || 1;
+  const height = target.clientHeight || 1;
+  overlay.width = width;
+  overlay.height = height;
+  ctx.clearRect(0, 0, width, height);
+  if (!frameWidth || !frameHeight) return;
+  const scale = Math.min(width / frameWidth, height / frameHeight);
+  const offsetX = (width - frameWidth * scale) / 2;
+  const offsetY = (height - frameHeight * scale) / 2;
   ctx.lineWidth = 2;
   ctx.font = '13px sans-serif';
-  boxes.forEach((b) => {
+  boxes.forEach((box) => {
+    const x = offsetX + box.x * scale;
+    const y = offsetY + box.y * scale;
+    const w = box.w * scale;
+    const h = box.h * scale;
     ctx.strokeStyle = '#00e1ff';
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.strokeRect(b.x, b.y, b.w, b.h);
-    const text = `${b.label} ${(b.conf * 100).toFixed(0)}%`;
-    ctx.fillRect(b.x, b.y - 20, ctx.measureText(text).width + 8, 20);
+    ctx.fillStyle = 'rgba(0,0,0,.65)';
+    ctx.strokeRect(x, y, w, h);
+    const text = `${box.label} ${(box.conf * 100).toFixed(0)}%`;
+    const textWidth = ctx.measureText(text).width + 10;
+    ctx.fillRect(x, Math.max(0, y - 22), textWidth, 22);
     ctx.fillStyle = '#fff';
-    ctx.fillText(text, b.x + 4, b.y - 6);
+    ctx.fillText(text, x + 5, Math.max(15, y - 7));
   });
 }
 
@@ -94,290 +339,191 @@ function renderCounts(counts = {}) {
     countList.innerHTML = '<li class="list-group-item">暂无检测数据</li>';
     return;
   }
-  entries.forEach(([k, v]) => {
+  entries.forEach(([label, count]) => {
     const item = document.createElement('li');
     item.className = 'list-group-item d-flex justify-content-between';
-    item.innerHTML = `<span>${k}</span><strong>${v}</strong>`;
+    item.innerHTML = `<span>${label}</span><strong>${count}</strong>`;
     countList.appendChild(item);
   });
 }
 
-function patchConfigInputs(cfg = {}) {
-  document.getElementById('cfgResolution').value = cfg.resolution || '720P';
-  document.getElementById('cfgFps').value = cfg.fps || 15;
-  document.getElementById('cfgExposure').value = cfg.exposure ?? 50;
-  document.getElementById('cfgGain').value = cfg.gain ?? 1;
-  document.getElementById('cfgBaudrate').value = cfg.baudrate || 115200;
-  document.getElementById('cfgTimeout').value = cfg.serial_timeout || 800;
-  document.getElementById('cfgAwb').checked = !!cfg.auto_white_balance;
-  document.getElementById('cfgFlipH').checked = !!cfg.flip_horizontal;
-  document.getElementById('cfgFlipV').checked = !!cfg.flip_vertical;
-}
-
-async function refreshSystem() {
-  const data = await fetch('/api/system/status').then((r) => r.json());
-  if (!data.ok) return;
-
-  const remoteType = data.camera_type || 'local';
-  const shouldSyncConfig = Date.now() >= configSyncPausedUntil && !isConfigEditing();
-  if ((data.camera_on || data.openmv_connected) && shouldSyncConfig) {
-    cameraType.value = remoteType;
+async function captureDetectionPayload() {
+  if (sourceType.value === 'serial') {
+    return serialImage.src?.startsWith('data:image') ? { frame: serialImage.src } : null;
   }
-  openmvPanel.classList.toggle('d-none', cameraType.value !== 'openmv');
-
-  const isOnline = data.camera_on && data.camera_state !== '未连接';
-  document.getElementById('cameraStateMini').textContent = isOnline ? '在线' : '离线';
-
-  statusText.textContent = `状态：${data.detection_on ? '运行中' : (data.camera_on ? '摄像头已开启' : '待机')}`;
-  cameraMeta.textContent = `类型：${data.camera_type || '-'} | 分辨率：${data.openmv_settings?.resolution || '-'} | 帧率：${data.openmv_settings?.fps || '-'}fps`;
-  perfMeta.textContent = `推理耗时：${data.last_inference_ms || '-'}ms`;
-
-  modelMeta.textContent = `模型：${data.model_name || '-'}（${data.model_loaded ? '已加载' : '未加载'}）`;
-
-
-  const cfg = data.openmv_settings || {};
-  if (shouldSyncConfig) patchConfigInputs(cfg);
-  document.getElementById('cfgMeta1').textContent = `波特率：${cfg.baudrate || '-'} | 曝光：${cfg.exposure || '-'} | 增益：${cfg.gain || '-'}`;
-  document.getElementById('cfgMeta2').textContent = `超时：${cfg.serial_timeout || '-'}ms | 自动白平衡：${cfg.auto_white_balance ? '开' : '关'} | 镜像：${cfg.flip_horizontal ? 'H' : '-'}${cfg.flip_vertical ? 'V' : '-'}`;
-
-  syncDuration(data.today_detection_seconds || 0, data.camera_on);
-  await ensureCameraPreview(data);
-  ensureDetectionPolling(data.camera_on && data.detection_on);
+  if (!stream || !video.videoWidth || !video.videoHeight) return null;
+  const canvas = document.createElement('canvas');
+  const scale = Math.min(1, DETECTION_FRAME_MAX_SIZE / Math.max(video.videoWidth, video.videoHeight));
+  canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+  canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+  canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+  return { frame: canvas.toDataURL('image/jpeg', 0.68) };
 }
 
 async function pollDetection() {
-  let payload = null;
-  if (cameraType.value === 'local' && stream) {
-    const cap = document.createElement('canvas');
-    cap.width = video.videoWidth || 640;
-    cap.height = video.videoHeight || 480;
-    const capCtx = cap.getContext('2d');
-    capCtx.drawImage(video, 0, 0, cap.width, cap.height);
-    payload = { frame: cap.toDataURL('image/jpeg', 0.72) };
-  }
-  if (cameraType.value === 'openmv' && openmvImage?.src?.startsWith('data:image')) {
-    payload = { frame: openmvImage.src };
-  }
-  const data = await postApi('/api/detection/frame-data', payload);
-  if (!data.ok) {
-    statusText.textContent = `状态：${data.message || '错误'}`;
-    return;
-  }
-  drawBoxes(data.boxes);
-  renderCounts(data.counts);
-
-  const stat = await fetch('/api/stats/live').then((r) => r.json());
-  const cards = stat.cards;
-  const running = cards.camera_on && data.detection_on;
-  statusText.textContent = `状态：${running ? '运行中' : '待机'}`;
-  cameraMeta.textContent = `类型：${cards.camera_type || '-'} | 分辨率：${cards.resolution || '-'} | 帧率：${cards.fps || '-'}fps`;
-  perfMeta.textContent = `推理耗时：${Number(cards.inference_ms || 0).toFixed(2)}ms`;
-  document.getElementById('onlineUsers').textContent = cards.active_users;
-}
-
-async function pollOpenmvFrames() {
-  const data = await fetch('/api/openmv/frame').then((r) => r.json()).catch(() => ({ ok: false }));
-  if (!data.ok) {
-    openmvConnStatus.textContent = `连接状态：未收到视频帧（${data.message || '等待中'}）`;
-    document.getElementById('cameraStateMini').textContent = '离线';
-    return;
-  }
-  openmvImage.src = `data:image/jpeg;base64,${data.frame}`;
-  const target = document.getElementById('openmvTarget').value.trim() || '-';
-  openmvConnStatus.textContent = `连接状态：已连接 | 视频端口：${target} | RX=${data.len}`;
-  document.getElementById('cameraStateMini').textContent = '在线';
-}
-
-async function ensureCameraPreview(data) {
-  if (!data.camera_on) {
-    stopLocalStream();
-    video.classList.remove('d-none');
-    openmvImage.classList.add('d-none');
-    if (frameTimer) {
-      clearInterval(frameTimer);
-      frameTimer = null;
+  if (detectionRequestInFlight) return;
+  const payload = await captureDetectionPayload();
+  if (!payload) return;
+  detectionRequestInFlight = true;
+  try {
+    const data = await postApi('/api/detection/frame-data', payload);
+    if (!data.ok) {
+      statusText.textContent = `状态：${data.message || '检测失败'}`;
+      return;
     }
-    return;
-  }
-
-  if (data.camera_type === 'local') {
-    openmvImage.classList.add('d-none');
-    video.classList.remove('d-none');
-    if (!stream) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
-        video.srcObject = stream;
-      } catch (e) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-          video.srcObject = stream;
-        } catch (fallbackError) {
-          statusText.textContent = '状态：无法恢复本地摄像头画面（请检查权限）';
-          await postApi('/api/camera/stop');
-        }
-      }
-    }
-    if (frameTimer) {
-      clearInterval(frameTimer);
-      frameTimer = null;
-    }
-  } else {
-    stopLocalStream();
-    video.classList.add('d-none');
-    openmvImage.classList.remove('d-none');
-    if (!frameTimer) frameTimer = setInterval(pollOpenmvFrames, 500);
-    pollOpenmvFrames();
+    lastBoxes = data.boxes || [];
+    lastFrameSize = { width: data.frame_width || 0, height: data.frame_height || 0 };
+    drawBoxes();
+    renderCounts(data.counts);
+    statusText.textContent = '状态：实时检测中';
+    perfMeta.textContent = `推理耗时：${Number(data.inference_ms || 0).toFixed(2)}ms`;
+  } finally {
+    detectionRequestInFlight = false;
   }
 }
 
 function ensureDetectionPolling(enabled) {
-  if (enabled && !timer) {
-    timer = setInterval(pollDetection, 1200);
+  if (enabled && !detectionTimer) {
+    detectionTimer = setInterval(pollDetection, DETECTION_INTERVAL_MS);
     pollDetection();
   }
-  if (!enabled && timer) {
-    clearInterval(timer);
-    timer = null;
+  if (!enabled && detectionTimer) clearInterval(detectionTimer);
+  if (!enabled) {
+    detectionTimer = null;
+    lastBoxes = [];
     drawBoxes([]);
   }
 }
 
-cameraType.onchange = () => {
-  openmvPanel.classList.toggle('d-none', cameraType.value !== 'openmv');
-};
-
-document.getElementById('openmvMode').onchange = (e) => {
-  const target = document.getElementById('openmvTarget');
-  if (e.target.value === 'network') {
-    target.placeholder = 'http://ip:port/snapshot.jpg 或 192.168.1.10:8080';
-  } else {
-    target.placeholder = '串口号，如 COM3 或 /dev/ttyUSB0';
-  }
-};
-
-document.getElementById('applyCameraCfgBtn').onclick = async () => {
-  const payload = {
-    camera_type: cameraType.value,
-    resolution: document.getElementById('cfgResolution').value,
-    fps: Number(document.getElementById('cfgFps').value || 15),
-    exposure: Number(document.getElementById('cfgExposure').value || 50),
-    gain: Number(document.getElementById('cfgGain').value || 1),
-    baudrate: Number(document.getElementById('cfgBaudrate').value || 115200),
-    serial_timeout: Number(document.getElementById('cfgTimeout').value || 800),
-    auto_white_balance: document.getElementById('cfgAwb').checked,
-    flip_horizontal: document.getElementById('cfgFlipH').checked,
-    flip_vertical: document.getElementById('cfgFlipV').checked,
-  };
-  const resp = await postApi('/api/openmv/settings', payload);
-  configSyncPausedUntil = Date.now() + 5000;
-  if (resp.ok && cameraType.value === 'local' && stream) {
-    const track = stream.getVideoTracks()[0];
-    if (track?.applyConstraints) {
-      const fps = Number(payload.fps || 15);
-      const widthMap = { QVGA: 320, VGA: 640, '720P': 1280, '1080P': 1920 };
-      const width = widthMap[payload.resolution] || 1280;
-      try {
-        await track.applyConstraints({ width: { ideal: width }, frameRate: { ideal: fps, max: fps } });
-      } catch (e) {
-        showToast('本地摄像头不支持该参数，已尽量应用', 'warning');
-      }
+async function refreshSystem() {
+  try {
+    const [statusResponse, statsResponse] = await Promise.all([
+      fetch('/api/system/status'),
+      fetch('/api/stats/live'),
+    ]);
+    const data = await statusResponse.json();
+    const stats = await statsResponse.json();
+    if (!data.ok) return;
+    serialConnected = !!data.machine_connected;
+    if (
+      data.camera_on
+      && ['builtin', 'usb', 'serial'].includes(data.camera_type)
+      && sourceType.value !== data.camera_type
+    ) {
+      sourceType.value = data.camera_type;
+      updateSourcePanels();
+    } else if (serialConnected && data.camera_type === 'serial' && sourceType.value !== 'serial') {
+      sourceType.value = 'serial';
+      updateSourcePanels();
     }
+    if (serialConnected) {
+      startSerialFramePolling();
+      serialStatusText.textContent = `设备通信模块已连接：${data.machine_settings?.port || '-'} @ ${data.machine_settings?.baudrate || '-'}。`;
+    }
+    document.getElementById('cameraStateMini').textContent = data.camera_on ? '在线' : '离线';
+    statusText.textContent = `状态：${data.detection_on ? '实时检测中' : (data.camera_on ? '采集源已开启' : '待机')}`;
+    const config = data.camera_settings || {};
+    cameraMeta.textContent = `设备：${data.camera_label || '-'} | 分辨率：${config.resolution || '-'} | 帧率：${config.fps || '-'}fps`;
+    modelMeta.textContent = `模型：${data.model_name || '-'}（${data.model_backend || '-'} / ${data.model_loaded ? '已加载' : '未加载'}）`;
+    document.getElementById('cfgResolution').value = config.resolution || '720P';
+    document.getElementById('cfgFps').value = config.fps || 20;
+    document.getElementById('cfgFlipH').checked = !!config.flip_horizontal;
+    document.getElementById('cfgFlipV').checked = !!config.flip_vertical;
+    const machine = data.machine_settings || {};
+    if (machine.port && !document.getElementById('serialPortSelect').value) {
+      const option = document.createElement('option');
+      option.value = machine.port;
+      option.textContent = machine.port;
+      document.getElementById('serialPortSelect').appendChild(option);
+      document.getElementById('serialPortSelect').value = machine.port;
+    }
+    document.getElementById('serialBaudrate').value = String(machine.baudrate || 115200);
+    applyMirrorTransform();
+    syncDuration(data.today_detection_seconds || 0, data.camera_on);
+    document.getElementById('onlineUsers').textContent = stats.cards?.active_users || 0;
+    const previewReady = sourceType.value === 'serial' ? !!serialImage.src : !!stream;
+    ensureDetectionPolling(data.camera_on && data.detection_on && previewReady);
+  } catch (error) {
+    statusText.textContent = '状态：服务连接异常';
   }
-  showToast(resp.ok ? '摄像头参数已应用' : (resp.message || '参数应用失败'), resp.ok ? 'success' : 'danger');
-  await refreshSystem();
-};
+}
 
-document.getElementById('scanPortBtn').onclick = async () => {
-  const data = await fetch('/api/openmv/ports').then((r) => r.json());
-  if (!data.ok || !data.ports.length) {
-    showToast('未检测到可用串口，请手动输入。', 'warning');
-    return;
-  }
-  document.getElementById('openmvTarget').value = data.ports[0];
-  showToast(`已扫描到 ${data.ports.length} 个串口`, 'info');
-};
-
-document.getElementById('connectOpenmvBtn').onclick = async () => {
-  const mode = document.getElementById('openmvMode').value;
-  const target = document.getElementById('openmvTarget').value.trim();
-  const baudrate = Number(document.getElementById('cfgBaudrate').value || 115200);
-  await postApi('/api/openmv/settings', { baudrate });
-  const data = await postApi('/api/openmv/connect', { mode, target });
-  if (!data.ok) {
-    openmvConnStatus.textContent = `连接状态：失败（${data.message || '未知错误'}）`;
-    showToast(data.message || 'OpenMV 连接失败', 'danger');
-    return;
-  }
-  cameraType.value = 'openmv';
-  openmvPanel.classList.remove('d-none');
-  openmvConnStatus.textContent = `连接状态：已连接 (${mode} ${target})`;
-  showToast('OpenMV 连接成功');
-};
-
-document.getElementById('disconnectOpenmvBtn').onclick = async () => {
-  await postApi('/api/openmv/disconnect');
-  openmvConnStatus.textContent = '连接状态：未连接 | 视频端口：--';
-  showToast('OpenMV 已断开', 'secondary');
-};
-
-document.getElementById('openCameraBtn').onclick = async () => {
-  const resp = await postApi('/api/camera/start', { camera_type: cameraType.value });
-  if (!resp.ok) {
-    showToast(resp.message || '摄像头开启失败', 'warning');
-    return;
-  }
-  ensureDetectionPolling(!!resp.detection_on);
-
-  showToast('摄像头已开启，同时已开启检测');
-
-  await refreshSystem();
-};
-
-document.getElementById('closeCameraBtn').onclick = async () => {
-  stopLocalStream();
-  await postApi('/api/camera/stop');
+sourceType.onchange = async () => {
   ensureDetectionPolling(false);
-  drawBoxes([]);
+  stopBrowserStream();
+  updateSourcePanels();
+  if (sourceType.value !== 'serial') await enumerateCameras(false);
+};
+document.getElementById('refreshCameraBtn').onclick = async () => {
+  try {
+    await enumerateCameras(true);
+    showToast('摄像头设备列表已刷新');
+  } catch (error) {
+    showToast('无法获取摄像头权限', 'warning');
+  }
+};
+document.getElementById('scanSerialBtn').onclick = scanSerialPorts;
+document.getElementById('connectSerialBtn').onclick = connectSerialDevice;
+document.getElementById('disconnectSerialBtn').onclick = disconnectSerialDevice;
+document.getElementById('sendSerialCommandBtn').onclick = sendSerialCommand;
+document.getElementById('openCameraBtn').onclick = openSelectedSource;
+document.getElementById('closeCameraBtn').onclick = async () => {
+  ensureDetectionPolling(false);
+  stopBrowserStream();
+  await postApi('/api/camera/stop');
   renderCounts({});
-  statusText.textContent = '状态：摄像头已关闭，检测已停止';
-  showToast('摄像头已关闭，检测已停止', 'secondary');
+  statusText.textContent = '状态：采集源已关闭';
+  showToast('采集源已关闭', 'secondary');
   await refreshSystem();
 };
-
 document.getElementById('startDetBtn').onclick = async () => {
+  const ready = sourceType.value === 'serial' ? serialConnected : !!stream;
+  if (!ready) {
+    showToast('请先打开采集源', 'warning');
+    return;
+  }
   const data = await postApi('/api/detection/start');
   if (!data.ok) {
-    statusText.textContent = `状态：${data.message}`;
-    showToast(`检测开启失败：${data.message}`, 'warning');
+    showToast(data.message || '检测开启失败', 'warning');
     return;
   }
   ensureDetectionPolling(true);
-  statusText.textContent = '状态：运行中';
 };
-
 document.getElementById('stopDetBtn').onclick = async () => {
   await postApi('/api/detection/stop');
   ensureDetectionPolling(false);
-  statusText.textContent = '状态：检测已停止（摄像头保持开启）';
-  showToast('检测已关闭，摄像头保持开启', 'secondary');
+  statusText.textContent = '状态：检测已停止，采集源保持开启';
 };
-
+document.getElementById('applyCameraCfgBtn').onclick = async () => {
+  const payload = {
+    resolution: document.getElementById('cfgResolution').value,
+    fps: Number(document.getElementById('cfgFps').value || 20),
+    flip_horizontal: document.getElementById('cfgFlipH').checked,
+    flip_vertical: document.getElementById('cfgFlipV').checked,
+  };
+  const result = await postApi('/api/camera/settings', payload);
+  if (!result.ok) {
+    showToast(result.message || '参数保存失败', 'danger');
+    return;
+  }
+  applyMirrorTransform();
+  if (stream) await openSelectedSource();
+  showToast('采集参数已应用');
+};
 document.getElementById('fullscreenBtn').onclick = async () => {
   const wrap = document.getElementById('videoWrap');
-  const btn = document.getElementById('fullscreenBtn');
-  if (!document.fullscreenElement) {
-    await wrap.requestFullscreen();
-    btn.textContent = '📥';
-  } else {
-    await document.exitFullscreen();
-    btn.textContent = '📤';
-  }
+  if (!document.fullscreenElement) await wrap.requestFullscreen();
+  else await document.exitFullscreen();
 };
 
-setInterval(refreshSystem, 2500);
+serialImage.onload = drawBoxes;
+window.addEventListener('resize', drawBoxes);
+window.addEventListener('beforeunload', stopBrowserStream);
+navigator.mediaDevices?.addEventListener?.('devicechange', () => enumerateCameras(false));
+
+updateSourcePanels();
+enumerateCameras(false).catch(() => {});
+scanSerialPorts().catch(() => {});
 refreshSystem();
 renderDurationTick();
-
-window.addEventListener('beforeunload', () => {
-  stopLocalStream();
-});
+setInterval(refreshSystem, 2500);
